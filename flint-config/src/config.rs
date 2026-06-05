@@ -216,12 +216,10 @@ fn merge_file(config: &mut Config, path: &Path) -> anyhow::Result<()> {
 }
 
 fn merge_provider(target: &mut crate::config::ProviderConfig, source: &crate::config::ProviderConfig) {
-    if source.r#type != default_provider_type() {
-        target.r#type = source.r#type.clone();
-    }
-    if source.model != default_model() {
-        target.model = source.model.clone();
-    }
+    // Always merge provider config from file, even if values match defaults
+    // This ensures user's explicit config is respected
+    target.r#type = source.r#type.clone();
+    target.model = source.model.clone();
 }
 
 fn merge_agent(target: &mut AgentConfig, source: &AgentConfig) {
