@@ -22,23 +22,23 @@ use std::io;
 // ── Model presets per provider ──────────────────────────────────────────────
 
 struct ModelPreset {
-    name: &'static str,
-    description: &'static str,
+    name: String,
+    description: String,
 }
 
 fn models_for_provider(provider: &str) -> Vec<ModelPreset> {
     match provider {
         "openai" => vec![
-            ModelPreset { name: "gpt-4o", description: "Fast, capable" },
-            ModelPreset { name: "gpt-4o-mini", description: "Cheapest GPT-4 class" },
-            ModelPreset { name: "gpt-4-turbo", description: "GPT-4 with tools" },
-            ModelPreset { name: "o1", description: "Reasoning model" },
-            ModelPreset { name: "o1-mini", description: "Fast reasoning" },
+            ModelPreset { name: "gpt-4o".into(), description: "Fast, capable".into() },
+            ModelPreset { name: "gpt-4o-mini".into(), description: "Cheapest GPT-4 class".into() },
+            ModelPreset { name: "gpt-4-turbo".into(), description: "GPT-4 with tools".into() },
+            ModelPreset { name: "o1".into(), description: "Reasoning model".into() },
+            ModelPreset { name: "o1-mini".into(), description: "Fast reasoning".into() },
         ],
         "anthropic" => vec![
-            ModelPreset { name: "claude-sonnet-4-20250514", description: "Best balance" },
-            ModelPreset { name: "claude-3-5-haiku-20241022", description: "Fast & cheap" },
-            ModelPreset { name: "claude-3-opus-20240229", description: "Most capable" },
+            ModelPreset { name: "claude-sonnet-4-20250514".into(), description: "Best balance".into() },
+            ModelPreset { name: "claude-3-5-haiku-20241022".into(), description: "Fast & cheap".into() },
+            ModelPreset { name: "claude-3-opus-20240229".into(), description: "Most capable".into() },
         ],
         _ => vec![],
     }
@@ -58,10 +58,18 @@ struct App {
 
 impl App {
     fn new(provider: &str, current_model: &str) -> Self {
-        let presets = models_for_provider(provider);
+        let mut presets = models_for_provider(provider);
         let mut list_state = ListState::default();
 
-        // Pre-select current model if it's in the list
+        // If current model is not in presets, add it at the top
+        if !presets.iter().any(|p| p.name == current_model) {
+            presets.insert(0, ModelPreset {
+                name: current_model.to_string(),
+                description: "Current (custom)".into(),
+            });
+        }
+
+        // Pre-select current model
         let idx = presets.iter().position(|p| p.name == current_model);
         list_state.select(idx.or(Some(0)));
 
@@ -105,7 +113,7 @@ impl App {
         }
         if let Some(i) = self.list_state.selected() {
             if i < self.presets.len() {
-                self.selected = Some(self.presets[i].name.to_string());
+                self.selected = Some(self.presets[i].name.clone());
             } else {
                 // "Custom" item selected — enter input mode
                 self.input_mode = true;
@@ -169,7 +177,7 @@ fn draw(f: &mut Frame, app: &mut App, provider: &str) {
                     format!("{:<32}", p.name),
                     Style::default().fg(Color::White),
                 ),
-                Span::styled(p.description, Style::default().fg(Color::DarkGray)),
+                Span::styled(p.description.clone(), Style::default().fg(Color::DarkGray)),
             ]))
         })
         .collect();
