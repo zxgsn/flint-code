@@ -1,0 +1,26 @@
+[provider]
+type = "openai"
+model = "gpt-4o"
+
+[agent]
+max_turns = 50
+max_output_chars = 65536
+
+[session]
+persistence = true
+# path = '/path/to/.flint/sessions'
+
+[logging]
+level = "warn"
+
+[features.skills]
+enabled = true
+
+[features.memory]
+enabled = true
+
+[features.compaction]
+enabled = true
+
+[features.permissions]
+enabled = true
