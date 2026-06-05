@@ -9,6 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::io::Write;
+use std::sync::Mutex;
 use unicode_width::UnicodeWidthStr;
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -16,6 +17,64 @@ use unicode_width::UnicodeWidthStr;
 pub enum InputResult {
     Line(String),
     Exit,
+}
+
+// ── History ────────────────────────────────────────────────────────────────
+
+struct HistoryState {
+    lines: Vec<String>,
+    index: Option<usize>,
+}
+
+static HISTORY: Mutex<HistoryState> = Mutex::new(HistoryState {
+    lines: Vec::new(),
+    index: None,
+});
+
+fn add_to_history(line: &str) {
+    if !line.trim().is_empty() {
+        let mut state = HISTORY.lock().unwrap();
+        // Remove duplicate if exists
+        state.lines.retain(|h| h != line);
+        state.lines.push(line.to_string());
+        state.index = None;
+    }
+}
+
+fn get_prev_history() -> Option<String> {
+    let mut state = HISTORY.lock().unwrap();
+    if state.lines.is_empty() {
+        return None;
+    }
+
+    let idx = match state.index {
+        Some(i) => {
+            if i == 0 {
+                return None;
+            }
+            i - 1
+        }
+        None => state.lines.len() - 1,
+    };
+
+    state.index = Some(idx);
+    Some(state.lines[idx].clone())
+}
+
+fn get_next_history() -> Option<String> {
+    let mut state = HISTORY.lock().unwrap();
+    match state.index {
+        Some(i) => {
+            if i >= state.lines.len() - 1 {
+                state.index = None;
+                Some(String::new())
+            } else {
+                state.index = Some(i + 1);
+                Some(state.lines[i + 1].clone())
+            }
+        }
+        None => None,
+    }
 }
 
 // ── Slash command definitions ──────────────────────────────────────────────
@@ -104,7 +163,26 @@ fn read_line_inner() -> Result<InputResult> {
                     )?;
                     write!(stdout, "\u{276f} {}", buf)?;
                     stdout.flush()?;
+                    add_to_history(&buf);
                     return Ok(InputResult::Line(buf));
+                }
+                // Up arrow — previous history
+                (KeyCode::Up, _) => {
+                    if let Some(prev) = get_prev_history() {
+                        buf = prev;
+                        tab_index = 0;
+                        render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Down arrow — next history
+                (KeyCode::Down, _) => {
+                    if let Some(next) = get_next_history() {
+                        buf = next;
+                        tab_index = 0;
+                        render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                    }
+                    ctrl_c_count = 0;
                 }
                 // Backspace
                 (KeyCode::Backspace, _) => {
