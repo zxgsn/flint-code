@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "flint-types",
+    "flint-config",
+    "flint-provider",
+    "flint-agent",
+    "flint-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+flint-types   = { path = "flint-types" }
+flint-config  = { path = "flint-config" }
+flint-provider = { path = "flint-provider" }
+flint-agent   = { path = "flint-agent" }
+
+tokio       = { version = "1", features = ["full"] }
+reqwest     = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+futures     = "0.3"
+async-trait = "0.1"
+anyhow      = "1"
+tracing     = "0.1"
+unicode-width = "0.2"

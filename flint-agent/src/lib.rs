@@ -1,0 +1,9 @@
+//! Agent runtime for flint — loop, tools, and session management.
+
+pub mod agent;
+pub mod session;
+pub mod tool;
+
+pub use agent::run_turn;
+pub use session::Session;
+pub use tool::{Tool, ToolContext, ToolRegistry};
