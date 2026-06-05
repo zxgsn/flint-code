@@ -158,6 +158,17 @@ Built-in commands:
   /help         Show this help message
   /quit         Exit the REPL
 
+Keyboard shortcuts:
+  Ctrl+A/E      Move to beginning/end of line
+  Ctrl+U/K      Delete to beginning/end of line
+  Ctrl+W        Delete previous word
+  Ctrl+L        Clear screen
+  Ctrl+Z        Undo
+  Ctrl+J        Insert newline (multiline input)
+  Up/Down       Navigate command history
+  Left/Right    Move cursor
+  Tab           Autocomplete slash commands
+
 Anything else is sent to the LLM as a message.
 
 Skills are auto-injected when your message matches a skill name or description.

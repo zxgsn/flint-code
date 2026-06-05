@@ -29,13 +29,16 @@ fn red(s: &str) -> String {
     format!("\x1b[31m{}\x1b[0m", s)
 }
 
-
 fn yellow(s: &str) -> String {
     format!("\x1b[33m{}\x1b[0m", s)
 }
 
 fn bold(s: &str) -> String {
     format!("\x1b[1m{}\x1b[0m", s)
+}
+
+fn cyan(s: &str) -> String {
+    format!("\x1b[36m{}\x1b[0m", s)
 }
 
 fn format_elapsed(elapsed: std::time::Duration) -> String {
@@ -66,8 +69,8 @@ pub async fn run_turn(
     loop {
         turn_iter += 1;
 
-        // Show thinking indicator with elapsed timer
-        print!("\r\x1b[K⟳ {}", dim("Thinking..."));
+        // Show thinking indicator
+        print!("\r\x1b[K{} {}", cyan("⟳"), dim("Thinking..."));
         std::io::stdout().flush()?;
 
         let api_start = Instant::now();

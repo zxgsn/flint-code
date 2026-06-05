@@ -105,12 +105,14 @@ pub fn read_line() -> Result<InputResult> {
 
 fn read_line_inner() -> Result<InputResult> {
     let mut buf = String::new();
+    let mut cursor_pos: usize = 0;
     let mut ctrl_c_count: u8 = 0;
     let mut completion_lines: u16 = 0;
     let mut tab_index: usize = 0;
+    let mut undo_stack: Vec<(String, usize)> = Vec::new();
 
     // Record the input row once at the start
-    let (_, input_row) = crossterm::cursor::position()?;
+    let (_, start_row) = crossterm::cursor::position()?;
 
     loop {
         if let Event::Key(KeyEvent {
@@ -127,9 +129,9 @@ fn read_line_inner() -> Result<InputResult> {
                     if ctrl_c_count >= 2 {
                         return Ok(InputResult::Exit);
                     }
-                    clear_used_lines(input_row, completion_lines)?;
+                    clear_used_lines(start_row, completion_lines)?;
                     let mut stdout = std::io::stdout();
-                    execute!(stdout, crossterm::cursor::MoveTo(0, input_row))?;
+                    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
                     execute!(
                         stdout,
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
@@ -137,6 +139,7 @@ fn read_line_inner() -> Result<InputResult> {
                     write!(stdout, "(press Ctrl+C again to exit)")?;
                     stdout.flush()?;
                     buf.clear();
+                    cursor_pos = 0;
                     completion_lines = 0;
                 }
                 // Tab — cycle through matching completions
@@ -146,17 +149,18 @@ fn read_line_inner() -> Result<InputResult> {
                         if !matches.is_empty() {
                             tab_index = tab_index % matches.len();
                             buf = matches[tab_index].to_string();
+                            cursor_pos = buf.len();
                             tab_index += 1;
-                            render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                            render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                         }
                     }
                     ctrl_c_count = 0;
                 }
                 // Enter — submit
                 (KeyCode::Enter, _) => {
-                    clear_used_lines(input_row, completion_lines)?;
+                    clear_used_lines(start_row, completion_lines)?;
                     let mut stdout = std::io::stdout();
-                    execute!(stdout, crossterm::cursor::MoveTo(0, input_row))?;
+                    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
                     execute!(
                         stdout,
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
@@ -170,8 +174,9 @@ fn read_line_inner() -> Result<InputResult> {
                 (KeyCode::Up, _) => {
                     if let Some(prev) = get_prev_history() {
                         buf = prev;
+                        cursor_pos = buf.len();
                         tab_index = 0;
-                        render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
                 }
@@ -179,24 +184,128 @@ fn read_line_inner() -> Result<InputResult> {
                 (KeyCode::Down, _) => {
                     if let Some(next) = get_next_history() {
                         buf = next;
+                        cursor_pos = buf.len();
                         tab_index = 0;
-                        render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Left arrow — move cursor left
+                (KeyCode::Left, _) => {
+                    if cursor_pos > 0 {
+                        cursor_pos -= 1;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Right arrow — move cursor right
+                (KeyCode::Right, _) => {
+                    if cursor_pos < buf.len() {
+                        cursor_pos += 1;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
                 }
                 // Backspace
                 (KeyCode::Backspace, _) => {
-                    if buf.pop().is_some() {
+                    if cursor_pos > 0 {
+                        undo_stack.push((buf.clone(), cursor_pos));
+                        buf.remove(cursor_pos - 1);
+                        cursor_pos -= 1;
                         tab_index = 0;
-                        render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Delete
+                (KeyCode::Delete, _) => {
+                    if cursor_pos < buf.len() {
+                        undo_stack.push((buf.clone(), cursor_pos));
+                        buf.remove(cursor_pos);
+                        tab_index = 0;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+A — move to beginning of line
+                (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                    cursor_pos = 0;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+E — move to end of line
+                (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                    cursor_pos = buf.len();
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+U — delete to beginning of line
+                (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                    undo_stack.push((buf.clone(), cursor_pos));
+                    buf.drain(..cursor_pos);
+                    cursor_pos = 0;
+                    tab_index = 0;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+K — delete to end of line
+                (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                    undo_stack.push((buf.clone(), cursor_pos));
+                    buf.truncate(cursor_pos);
+                    tab_index = 0;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+W — delete previous word
+                (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                    if cursor_pos > 0 {
+                        undo_stack.push((buf.clone(), cursor_pos));
+                        let before = buf[..cursor_pos].to_string();
+                        let new_pos = before.trim_end().len();
+                        let trimmed = before[..new_pos].trim_end_matches(|c: char| !c.is_alphanumeric());
+                        let new_cursor = trimmed.len();
+                        buf.drain(new_cursor..cursor_pos);
+                        cursor_pos = new_cursor;
+                        tab_index = 0;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    }
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+L — clear screen
+                (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                    let mut stdout = std::io::stdout();
+                    execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+                    execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
+                    // Re-render input at top
+                    let (_, new_row) = crossterm::cursor::position()?;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, new_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+Z — undo
+                (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+                    if let Some((prev_buf, prev_pos)) = undo_stack.pop() {
+                        buf = prev_buf;
+                        cursor_pos = prev_pos;
+                        tab_index = 0;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
                 }
                 // Regular character
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                    buf.push(c);
+                    buf.insert(cursor_pos, c);
+                    cursor_pos += 1;
                     tab_index = 0;
-                    render_input_and_completions(&buf, &mut completion_lines, input_row)?;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    ctrl_c_count = 0;
+                }
+                // Ctrl+J — insert newline (alternative to Shift+Enter)
+                (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                    undo_stack.push((buf.clone(), cursor_pos));
+                    buf.insert(cursor_pos, '\n');
+                    cursor_pos += 1;
+                    tab_index = 0;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
                 }
                 (KeyCode::Esc, _) => {
@@ -223,13 +332,13 @@ fn get_completions(input: &str) -> Vec<&'static str> {
 
 // ── Terminal rendering ─────────────────────────────────────────────────────
 
-fn clear_used_lines(input_row: u16, old_completion_lines: u16) -> Result<()> {
+fn clear_used_lines(start_row: u16, old_completion_lines: u16) -> Result<()> {
     let mut stdout = std::io::stdout();
     let total = 1 + old_completion_lines;
     for i in 0..total {
         execute!(
             stdout,
-            crossterm::cursor::MoveTo(0, input_row + i),
+            crossterm::cursor::MoveTo(0, start_row + i),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
     }
@@ -239,8 +348,9 @@ fn clear_used_lines(input_row: u16, old_completion_lines: u16) -> Result<()> {
 
 fn render_input_and_completions(
     buf: &str,
+    cursor_pos: usize,
     completion_lines: &mut u16,
-    input_row: u16,
+    start_row: u16,
 ) -> Result<()> {
     let mut stdout = std::io::stdout();
     let prompt = "\u{276f} ";
@@ -267,31 +377,86 @@ fn render_input_and_completions(
         0
     };
 
+    // Calculate how many rows the input spans (considering newlines)
+    let prompt_width = prompt.width();
+    let mut current_row = 0u16;
+    let mut current_col = prompt_width;
+    let mut input_rows = 1u16;
+
+    for c in buf.chars() {
+        if c == '\n' {
+            current_row += 1;
+            current_col = 0;
+            input_rows = current_row + 1;
+        } else {
+            current_col += 1;
+            if current_col >= term_w {
+                current_row += 1;
+                current_col = 0;
+                input_rows = current_row + 1;
+            }
+        }
+    }
+
     // 2. Clear old completion lines by overwriting with spaces
     for i in 0..*completion_lines {
         execute!(
             stdout,
-            crossterm::cursor::MoveTo(0, input_row + 1 + i)
+            crossterm::cursor::MoveTo(0, start_row + input_rows + i)
         )?;
         let pad = " ".repeat(term_w);
         write!(stdout, "{}", pad)?;
     }
 
-    // 3. Draw input line — overwrite with padded content
-    execute!(stdout, crossterm::cursor::MoveTo(0, input_row))?;
-    let line_content = format!("{}{}", prompt, buf);
-    let ghost_text = ghost.unwrap_or("");
-    let full_line = format!("{}{}", line_content, ghost_text);
-    let padded = if full_line.len() < term_w {
-        format!("{:<width$}", full_line, width = term_w)
-    } else {
-        full_line.clone()
-    };
-    write!(stdout, "{}", padded)?;
+    // 3. Draw input line — clear and redraw
+    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
+    for row in 0..input_rows {
+        execute!(
+            stdout,
+            crossterm::cursor::MoveTo(0, start_row + row),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+        )?;
+    }
+    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
 
-    // 4. Redraw with proper colors (overwrite the padded version)
-    execute!(stdout, crossterm::cursor::MoveTo(0, input_row))?;
-    write!(stdout, "{}{}", prompt, buf)?;
+    // Draw prompt
+    write!(stdout, "{}", prompt)?;
+
+    // Syntax highlighting
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+    let is_command = buf.starts_with('/');
+
+    for c in buf.chars() {
+        if c == '\n' {
+            execute!(stdout, crossterm::style::ResetColor)?;
+            write!(stdout, "\n")?;
+            continue;
+        }
+
+        if is_command {
+            execute!(stdout, crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan))?;
+            write!(stdout, "{}", c)?;
+        } else {
+            if !in_quote && (c == '"' || c == '\'') {
+                in_quote = true;
+                quote_char = c;
+                execute!(stdout, crossterm::style::SetForegroundColor(crossterm::style::Color::Yellow))?;
+                write!(stdout, "{}", c)?;
+            } else if in_quote && c == quote_char {
+                write!(stdout, "{}", c)?;
+                execute!(stdout, crossterm::style::ResetColor)?;
+                in_quote = false;
+            } else {
+                if !in_quote {
+                    execute!(stdout, crossterm::style::ResetColor)?;
+                }
+                write!(stdout, "{}", c)?;
+            }
+        }
+    }
+    execute!(stdout, crossterm::style::ResetColor)?;
+
     if let Some(ghost_text) = ghost {
         execute!(
             stdout,
@@ -301,7 +466,7 @@ fn render_input_and_completions(
         execute!(stdout, crossterm::style::ResetColor)?;
     }
 
-    // 5. Draw completion list below input
+    // 4. Draw completion list below input
     if has_completions {
         for (i, cmd) in matches.iter().enumerate() {
             let desc = SLASH_COMMANDS
@@ -311,7 +476,7 @@ fn render_input_and_completions(
                 .unwrap_or("");
             execute!(
                 stdout,
-                crossterm::cursor::MoveTo(0, input_row + 1 + i as u16)
+                crossterm::cursor::MoveTo(0, start_row + input_rows + i as u16)
             )?;
             write!(stdout, "  {:<12} {}", cmd, desc)?;
         }
@@ -320,9 +485,22 @@ fn render_input_and_completions(
         *completion_lines = 0;
     }
 
-    // 6. Move cursor to input position
-    let cursor_col = prompt.width() as u16 + buf.width() as u16;
-    execute!(stdout, crossterm::cursor::MoveTo(cursor_col, input_row))?;
+    // 5. Move cursor to correct position (considering newlines and wrapping)
+    let mut cursor_row = 0u16;
+    let mut cursor_col = prompt_width;
+    for c in buf[..cursor_pos].chars() {
+        if c == '\n' {
+            cursor_row += 1;
+            cursor_col = 0;
+        } else {
+            cursor_col += 1;
+            if cursor_col >= term_w {
+                cursor_row += 1;
+                cursor_col = 0;
+            }
+        }
+    }
+    execute!(stdout, crossterm::cursor::MoveTo(cursor_col as u16, start_row + cursor_row))?;
     stdout.flush()?;
 
     Ok(())
