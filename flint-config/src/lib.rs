@@ -14,6 +14,6 @@ pub mod config;
 pub mod features;
 pub mod skill;
 
-pub use config::{AgentConfig, Config, LoggingConfig, ProviderConfig, SessionConfig, load};
+pub use config::{AgentConfig, Config, LoggingConfig, McpServerConfig, ProviderConfig, SessionConfig, load};
 pub use features::{Feature, Features};
 pub use skill::{Skill, SkillMeta};

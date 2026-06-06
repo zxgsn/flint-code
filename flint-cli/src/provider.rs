@@ -10,11 +10,7 @@ use flint_provider::Provider;
 // ── Home directory ─────────────────────────────────────────────────────────
 
 pub fn home_dir() -> Option<std::path::PathBuf> {
-    if cfg!(target_os = "windows") {
-        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
-    } else {
-        std::env::var("HOME").ok().map(std::path::PathBuf::from)
-    }
+    dirs::home_dir()
 }
 
 // ── .env loading ───────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@
 
 use crate::features::Features;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // ── Config sections ─────────────────────────────────────────────────────────
@@ -51,6 +52,18 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Command to spawn the MCP server process.
+    pub command: String,
+    /// Arguments to pass to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables for the server process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
 // ── Top-level config ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -65,6 +78,9 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub features: Features,
+    /// MCP server configurations. Key is the server ID.
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -211,6 +227,7 @@ fn merge_file(config: &mut Config, path: &Path) -> anyhow::Result<()> {
     merge_session(&mut config.session, &partial.session);
     merge_logging(&mut config.logging, &partial.logging);
     merge_features(&mut config.features, &partial.features);
+    merge_mcp_servers(&mut config.mcp_servers, &partial.mcp_servers);
 
     Ok(())
 }
@@ -257,6 +274,17 @@ fn merge_features(target: &mut Features, source: &Features) {
     // For now, if the file has a [features] section, it fully replaces.
     // This is acceptable because users writing [features] intend to control it.
     *target = source.clone();
+}
+
+fn merge_mcp_servers(
+    target: &mut HashMap<String, McpServerConfig>,
+    source: &HashMap<String, McpServerConfig>,
+) {
+    // MCP servers from the source file are added/override target.
+    // Servers only in target are preserved.
+    for (k, v) in source {
+        target.insert(k.clone(), v.clone());
+    }
 }
 
 // ── Defaults ────────────────────────────────────────────────────────────────

@@ -2,8 +2,10 @@
 
 mod config_ui;
 mod input;
+mod markdown;
 mod model_ui;
 mod provider;
+mod resume_ui;
 pub mod session_import;
 mod setup_ui;
 mod tools;
@@ -12,6 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flint_agent::{run_turn, Session, ToolContext, ToolRegistry};
 use flint_config::Feature;
+use flint_mcp::McpManager;
 use flint_provider::Provider;
 use std::io::Write;
 
@@ -114,6 +117,7 @@ enum SlashAction {
     Help,
     Status,
     Skills,
+    Mcp,
     Resume(Option<String>),
     Quit,
     Unknown(String),
@@ -140,6 +144,7 @@ fn parse_slash(input: &str) -> Option<SlashAction> {
         "help" | "h" | "?" => SlashAction::Help,
         "status" => SlashAction::Status,
         "skills" => SlashAction::Skills,
+        "mcp" => SlashAction::Mcp,
         "resume" => {
             let arg = input[1..].split_whitespace().nth(1);
             SlashAction::Resume(arg.map(|s| s.to_string()))
@@ -159,6 +164,7 @@ Built-in commands:
   /model <name> Switch to a specific model
   /skills       List available skills
   /skill <name> Load and show a specific skill
+  /mcp          Show MCP server status and tools
   /resume       List saved sessions (flint + Claude Code)
   /resume <id>  Restore a saved session
   /clear        Clear conversation history
@@ -241,11 +247,18 @@ fn print_status(config: &flint_config::Config, working_dir: &std::path::Path) {
         "disabled".to_string()
     };
 
+    let mcp_info = if config.mcp_servers.is_empty() {
+        "none".to_string()
+    } else {
+        format!("{} server(s)", config.mcp_servers.len())
+    };
+
     println!(
         "\
 Provider : {} / {}
 Session  : {} (persistence: {})
 Skills   : {}
+MCP      : {}
 
 Features:
   {} Skills       {} Memory
@@ -257,6 +270,7 @@ Skill directories:",
         config.session.path.display(),
         if config.session.persistence { "on" } else { "off" },
         skill_info,
+        mcp_info,
         if features.skills.enabled { "\u{2713}" } else { "\u{2717}" },
         if features.memory.enabled { "\u{2713}" } else { "\u{2717}" },
         if features.compaction.enabled {
@@ -277,59 +291,43 @@ Skill directories:",
     }
 }
 
-fn print_resume_sessions(config: &flint_config::Config, working_dir: &std::path::Path) {
-    let session_dir = &config.session.path;
-    let mut all_sessions: Vec<(String, flint_agent::SessionMeta, bool)> = Vec::new();
+fn load_session(path: &std::path::Path) -> Result<(flint_agent::Session, flint_agent::SessionMeta)> {
+    flint_agent::Session::load(path)
+}
 
-    // Load flint sessions
-    match flint_agent::Session::list_sessions(session_dir) {
-        Ok(sessions) => {
-            for meta in sessions {
-                all_sessions.push((meta.id.clone(), meta, false));
-            }
-        }
-        Err(_) => {}
-    }
-
-    // Load Claude Code sessions
-    match session_import::list_claude_sessions(working_dir) {
-        Ok(sessions) => {
-            for (_, meta) in sessions {
-                all_sessions.push((meta.id.clone(), meta, true));
-            }
-        }
-        Err(_) => {}
-    }
-
-    if all_sessions.is_empty() {
-        println!("No saved sessions found.");
-        println!();
+fn print_conversation_history(session: &flint_agent::Session) {
+    let messages = &session.messages;
+    if messages.is_empty() {
         return;
     }
 
-    // Sort by updated_at descending
-    all_sessions.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+    println!("Conversation history:");
+    println!("{}", "-".repeat(60));
 
-    println!("Saved sessions:\n");
-    for (i, (_, meta, is_claude)) in all_sessions.iter().enumerate() {
-        let updated = meta.updated_at.split('T').next().unwrap_or(&meta.updated_at);
-        let source = if *is_claude { "[Claude Code]" } else { "[Flint]" };
-        println!(
-            "  {}. {} {} {} ({}) [{} msgs]",
-            i + 1,
-            &meta.id[..8.min(meta.id.len())],
-            source,
-            meta.title,
-            updated,
-            meta.message_count
-        );
+    for msg in messages {
+        let text = msg.text();
+        if !text.is_empty() {
+            // Use colored role display
+            let role_display = match msg.role {
+                flint_types::Role::User => "\x1b[1;32mUser\x1b[0m",
+                flint_types::Role::Assistant => "\x1b[1;34mAssistant\x1b[0m",
+                flint_types::Role::System => "\x1b[1;33mSystem\x1b[0m",
+                flint_types::Role::Tool => "\x1b[1;35mTool\x1b[0m",
+            };
+
+            println!("{}:", role_display);
+            // Render markdown for assistant messages
+            if msg.role == flint_types::Role::Assistant {
+                markdown::print_markdown(&text);
+            } else {
+                println!("{}", text);
+            }
+            println!();
+        }
     }
-    println!("\nUse /resume <id> to restore a session");
-    println!();
-}
 
-fn load_session(path: &std::path::Path) -> Result<(flint_agent::Session, flint_agent::SessionMeta)> {
-    flint_agent::Session::load(path)
+    println!("{}", "-".repeat(60));
+    println!();
 }
 
 // ── System prompt with skills (progressive disclosure) ────────────────────
@@ -621,6 +619,26 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     let mut registry = ToolRegistry::new();
     tools::register_builtins(&mut registry);
 
+    // Connect to MCP servers and register their tools
+    let mut mcp_manager = McpManager::new();
+    if !config.mcp_servers.is_empty() {
+        eprintln!("Connecting to {} MCP server(s)...", config.mcp_servers.len());
+        match mcp_manager.connect_all(&config.mcp_servers).await {
+            Ok(mcp_tools) => {
+                let count = mcp_tools.len();
+                for tool in mcp_tools {
+                    registry.register(tool);
+                }
+                if count > 0 {
+                    eprintln!("MCP: {} tools registered", count);
+                }
+            }
+            Err(e) => {
+                eprintln!("MCP error: {}", e);
+            }
+        }
+    }
+
     let ctx = ToolContext {
         working_dir: working_dir.to_path_buf(),
     };
@@ -731,7 +749,50 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                                 }
                             }
                             None => {
-                                print_resume_sessions(&config, &working_dir);
+                                // Launch interactive TUI
+                                match resume_ui::run(&config, &working_dir) {
+                                    Ok(Some((path, meta))) => {
+                                        if meta.provider == "claude-code" {
+                                            match session_import::import_session(&path) {
+                                                Ok((loaded_session, loaded_meta)) => {
+                                                    session = loaded_session;
+                                                    current_session_meta = Some(loaded_meta.clone());
+                                                    let id_display = &loaded_meta.id[..8.min(loaded_meta.id.len())];
+                                                    println!("Resumed Claude Code session: {} ({})", loaded_meta.title, id_display);
+                                                    println!("  Provider: {} / {}", loaded_meta.provider, loaded_meta.model);
+                                                    println!("  Messages: {}\n", loaded_meta.message_count);
+                                                    // Display conversation history
+                                                    print_conversation_history(&session);
+                                                }
+                                                Err(e) => {
+                                                    println!("Error loading Claude Code session: {}\n", e);
+                                                }
+                                            }
+                                        } else {
+                                            match load_session(&path) {
+                                                Ok((loaded_session, loaded_meta)) => {
+                                                    session = loaded_session;
+                                                    current_session_meta = Some(loaded_meta.clone());
+                                                    let id_display = &loaded_meta.id[..8.min(loaded_meta.id.len())];
+                                                    println!("Resumed session: {} ({})", loaded_meta.title, id_display);
+                                                    println!("  Provider: {} / {}", loaded_meta.provider, loaded_meta.model);
+                                                    println!("  Messages: {}\n", loaded_meta.message_count);
+                                                    // Display conversation history
+                                                    print_conversation_history(&session);
+                                                }
+                                                Err(e) => {
+                                                    println!("Error loading session: {}\n", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        println!("Cancelled.\n");
+                                    }
+                                    Err(e) => {
+                                        println!("Error: {}\n", e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -843,6 +904,22 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                     SlashAction::Skills => {
                         print_skills(&config, &working_dir);
                     }
+                    SlashAction::Mcp => {
+                        let status = mcp_manager.status();
+                        if status.is_empty() {
+                            println!("No MCP servers configured.");
+                            println!("Add [mcp_servers.<id>] to .flint.toml:\n");
+                            println!("  [mcp_servers.memory]");
+                            println!("  command = \"npx\"");
+                            println!("  args = [\"-y\", \"@modelcontextprotocol/server-memory\"]\n");
+                        } else {
+                            println!("MCP Servers:");
+                            for (id, count) in &status {
+                                println!("  ✓ {} ({} tools)", id, count);
+                            }
+                            println!();
+                        }
+                    }
                     SlashAction::Skill(name) => {
                         match name {
                             Some(n) => {
@@ -930,6 +1007,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         }
     }
 
+    // Shut down MCP servers
+    mcp_manager.shutdown().await;
+
     Ok(())
 }
 
@@ -938,7 +1018,13 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let working_dir = std::fs::canonicalize(&cli.dir)?;
+    let working_dir = dunce::canonicalize(&cli.dir)?;
+
+    // Enable ANSI escape code support on Windows (pre-Windows 10 1511 consoles)
+    #[cfg(target_os = "windows")]
+    {
+        let _ = enable_ansi_support::enable_ansi_support();
+    }
 
     init_tracing("warn");
 

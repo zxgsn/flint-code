@@ -10,7 +10,7 @@ use crossterm::{
 };
 use std::io::Write;
 use std::sync::Mutex;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -300,7 +300,9 @@ fn read_line_inner() -> Result<InputResult> {
                 // Regular character
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
                     // Ensure cursor_pos is at a valid char boundary
-                    cursor_pos = buf.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(buf.len());
+                    if !buf.is_char_boundary(cursor_pos) {
+                        cursor_pos = buf.len();
+                    }
                     buf.insert(cursor_pos, c);
                     cursor_pos += c.len_utf8();
                     tab_index = 0;
@@ -311,7 +313,9 @@ fn read_line_inner() -> Result<InputResult> {
                 (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                     undo_stack.push((buf.clone(), cursor_pos));
                     // Ensure cursor_pos is at a valid char boundary
-                    cursor_pos = buf.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(buf.len());
+                    if !buf.is_char_boundary(cursor_pos) {
+                        cursor_pos = buf.len();
+                    }
                     buf.insert(cursor_pos, '\n');
                     cursor_pos += 1;
                     tab_index = 0;
@@ -370,8 +374,23 @@ fn render_input_and_completions(
     let matches = get_completions(buf);
     let ghost = if buf.starts_with('/') && !buf.is_empty() {
         matches.first().and_then(|cmd| {
-            if cmd.len() > buf.len() {
-                Some(&cmd[buf.len()..])
+            let cmd_width = cmd.width();
+            let buf_width = buf.width();
+            if cmd_width > buf_width {
+                // Get the remaining part of the command
+                let mut remaining = String::new();
+                let mut current_width = 0;
+                for c in cmd.chars() {
+                    if current_width >= buf_width {
+                        remaining.push(c);
+                    }
+                    current_width += c.width().unwrap_or(1);
+                }
+                if remaining.is_empty() {
+                    None
+                } else {
+                    Some(remaining)
+                }
             } else {
                 None
             }
@@ -387,7 +406,7 @@ fn render_input_and_completions(
         0
     };
 
-    // Calculate how many rows the input spans (considering newlines)
+    // Calculate how many rows the input spans (considering newlines and char widths)
     let prompt_width = prompt.width();
     let mut current_row = 0u16;
     let mut current_col = prompt_width;
@@ -399,27 +418,26 @@ fn render_input_and_completions(
             current_col = 0;
             input_rows = current_row + 1;
         } else {
-            current_col += 1;
+            let char_width = c.width().unwrap_or(1);
+            current_col += char_width;
             if current_col >= term_w {
                 current_row += 1;
-                current_col = 0;
+                current_col = char_width;
                 input_rows = current_row + 1;
             }
         }
     }
 
-    // 2. Clear old completion lines by overwriting with spaces
+    // 2. Clear old completion lines
     for i in 0..*completion_lines {
         execute!(
             stdout,
-            crossterm::cursor::MoveTo(0, start_row + input_rows + i)
+            crossterm::cursor::MoveTo(0, start_row + input_rows + i),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
-        let pad = " ".repeat(term_w);
-        write!(stdout, "{}", pad)?;
     }
 
-    // 3. Draw input line — clear and redraw
-    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
+    // 3. Clear input lines
     for row in 0..input_rows {
         execute!(
             stdout,
@@ -427,6 +445,8 @@ fn render_input_and_completions(
             crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
     }
+
+    // Move to start for drawing
     execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
 
     // Draw prompt
@@ -498,15 +518,20 @@ fn render_input_and_completions(
     // 5. Move cursor to correct position (considering newlines and wrapping)
     let mut cursor_row = 0u16;
     let mut cursor_col = prompt_width;
-    for c in buf[..cursor_pos].chars() {
+    // Use char_indices to properly handle multi-byte characters
+    for (i, c) in buf.char_indices() {
+        if i >= cursor_pos {
+            break;
+        }
         if c == '\n' {
             cursor_row += 1;
             cursor_col = 0;
         } else {
-            cursor_col += 1;
+            let char_width = c.width().unwrap_or(1);
+            cursor_col += char_width;
             if cursor_col >= term_w {
                 cursor_row += 1;
-                cursor_col = 0;
+                cursor_col = char_width;
             }
         }
     }

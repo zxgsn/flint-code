@@ -24,3 +24,12 @@ enabled = true
 
 [features.permissions]
 enabled = true
+
+# MCP servers — external tool servers via Model Context Protocol
+# [mcp_servers.memory]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-memory"]
+#
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]

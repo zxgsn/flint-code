@@ -14,6 +14,7 @@ flint-types    = { workspace = true }
 flint-config   = { workspace = true }
 flint-provider = { workspace = true }
 flint-agent    = { workspace = true }
+flint-mcp      = { workspace = true }
 tokio          = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
@@ -29,3 +30,5 @@ crossterm      = "0.28"
 unicode-width  = { workspace = true }
 uuid           = { version = "1", features = ["v4"] }
 dirs           = "5"
+dunce          = "1"
+enable-ansi-support = "0.2"

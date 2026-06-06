@@ -58,6 +58,11 @@ impl ToolRegistry {
         }
     }
 
+    /// Remove a tool by name. Returns true if it existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
