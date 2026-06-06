@@ -193,7 +193,8 @@ fn read_line_inner() -> Result<InputResult> {
                 // Left arrow — move cursor left
                 (KeyCode::Left, _) => {
                     if cursor_pos > 0 {
-                        cursor_pos -= 1;
+                        // Find previous char boundary
+                        cursor_pos = buf[..cursor_pos].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
@@ -201,7 +202,8 @@ fn read_line_inner() -> Result<InputResult> {
                 // Right arrow — move cursor right
                 (KeyCode::Right, _) => {
                     if cursor_pos < buf.len() {
-                        cursor_pos += 1;
+                        // Find next char boundary
+                        cursor_pos = buf[cursor_pos..].char_indices().nth(1).map(|(i, _)| cursor_pos + i).unwrap_or(buf.len());
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
@@ -210,8 +212,10 @@ fn read_line_inner() -> Result<InputResult> {
                 (KeyCode::Backspace, _) => {
                     if cursor_pos > 0 {
                         undo_stack.push((buf.clone(), cursor_pos));
-                        buf.remove(cursor_pos - 1);
-                        cursor_pos -= 1;
+                        // Find previous char boundary
+                        let prev_pos = buf[..cursor_pos].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                        buf.drain(prev_pos..cursor_pos);
+                        cursor_pos = prev_pos;
                         tab_index = 0;
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
@@ -221,7 +225,9 @@ fn read_line_inner() -> Result<InputResult> {
                 (KeyCode::Delete, _) => {
                     if cursor_pos < buf.len() {
                         undo_stack.push((buf.clone(), cursor_pos));
-                        buf.remove(cursor_pos);
+                        // Find next char boundary
+                        let next_pos = buf[cursor_pos..].char_indices().nth(1).map(|(i, _)| cursor_pos + i).unwrap_or(buf.len());
+                        buf.drain(cursor_pos..next_pos);
                         tab_index = 0;
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
@@ -293,8 +299,10 @@ fn read_line_inner() -> Result<InputResult> {
                 }
                 // Regular character
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                    // Ensure cursor_pos is at a valid char boundary
+                    cursor_pos = buf.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(buf.len());
                     buf.insert(cursor_pos, c);
-                    cursor_pos += 1;
+                    cursor_pos += c.len_utf8();
                     tab_index = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
@@ -302,6 +310,8 @@ fn read_line_inner() -> Result<InputResult> {
                 // Ctrl+J — insert newline (alternative to Shift+Enter)
                 (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                     undo_stack.push((buf.clone(), cursor_pos));
+                    // Ensure cursor_pos is at a valid char boundary
+                    cursor_pos = buf.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(buf.len());
                     buf.insert(cursor_pos, '\n');
                     cursor_pos += 1;
                     tab_index = 0;
