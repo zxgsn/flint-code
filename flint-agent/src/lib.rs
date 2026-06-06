@@ -5,5 +5,5 @@ pub mod session;
 pub mod tool;
 
 pub use agent::run_turn;
-pub use session::Session;
+pub use session::{Session, SessionMeta};
 pub use tool::{Tool, ToolContext, ToolRegistry};

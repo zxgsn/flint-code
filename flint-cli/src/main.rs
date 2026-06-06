@@ -4,6 +4,7 @@ mod config_ui;
 mod input;
 mod model_ui;
 mod provider;
+pub mod session_import;
 mod setup_ui;
 mod tools;
 
@@ -113,6 +114,7 @@ enum SlashAction {
     Help,
     Status,
     Skills,
+    Resume(Option<String>),
     Quit,
     Unknown(String),
 }
@@ -138,6 +140,10 @@ fn parse_slash(input: &str) -> Option<SlashAction> {
         "help" | "h" | "?" => SlashAction::Help,
         "status" => SlashAction::Status,
         "skills" => SlashAction::Skills,
+        "resume" => {
+            let arg = input[1..].split_whitespace().nth(1);
+            SlashAction::Resume(arg.map(|s| s.to_string()))
+        }
         "quit" | "exit" | "q" => SlashAction::Quit,
         other => SlashAction::Unknown(other.to_string()),
     })
@@ -153,6 +159,8 @@ Built-in commands:
   /model <name> Switch to a specific model
   /skills       List available skills
   /skill <name> Load and show a specific skill
+  /resume       List saved sessions (flint + Claude Code)
+  /resume <id>  Restore a saved session
   /clear        Clear conversation history
   /status       Show current config status
   /help         Show this help message
@@ -267,6 +275,61 @@ Skill directories:",
         let marker = if exists { "\u{2713}" } else { "\u{2717}" };
         println!("  {} {}", marker, dir.display());
     }
+}
+
+fn print_resume_sessions(config: &flint_config::Config, working_dir: &std::path::Path) {
+    let session_dir = &config.session.path;
+    let mut all_sessions: Vec<(String, flint_agent::SessionMeta, bool)> = Vec::new();
+
+    // Load flint sessions
+    match flint_agent::Session::list_sessions(session_dir) {
+        Ok(sessions) => {
+            for meta in sessions {
+                all_sessions.push((meta.id.clone(), meta, false));
+            }
+        }
+        Err(_) => {}
+    }
+
+    // Load Claude Code sessions
+    match session_import::list_claude_sessions(working_dir) {
+        Ok(sessions) => {
+            for (_, meta) in sessions {
+                all_sessions.push((meta.id.clone(), meta, true));
+            }
+        }
+        Err(_) => {}
+    }
+
+    if all_sessions.is_empty() {
+        println!("No saved sessions found.");
+        println!();
+        return;
+    }
+
+    // Sort by updated_at descending
+    all_sessions.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+
+    println!("Saved sessions:\n");
+    for (i, (_, meta, is_claude)) in all_sessions.iter().enumerate() {
+        let updated = meta.updated_at.split('T').next().unwrap_or(&meta.updated_at);
+        let source = if *is_claude { "[Claude Code]" } else { "[Flint]" };
+        println!(
+            "  {}. {} {} {} ({}) [{} msgs]",
+            i + 1,
+            &meta.id[..8.min(meta.id.len())],
+            source,
+            meta.title,
+            updated,
+            meta.message_count
+        );
+    }
+    println!("\nUse /resume <id> to restore a session");
+    println!();
+}
+
+fn load_session(path: &std::path::Path) -> Result<(flint_agent::Session, flint_agent::SessionMeta)> {
+    flint_agent::Session::load(path)
 }
 
 // ── System prompt with skills (progressive disclosure) ────────────────────
@@ -592,6 +655,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 
         println!();
         let mut session = Session::new();
+        let mut current_session_meta: Option<flint_agent::SessionMeta> = None;
         let mut turn_count: u32 = 0;
 
         loop {
@@ -618,7 +682,58 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                     SlashAction::Help => print_help(),
                     SlashAction::Clear => {
                         session = Session::new();
+                        current_session_meta = None;
                         println!("Session cleared.\n");
+                    }
+                    SlashAction::Resume(arg) => {
+                        match arg {
+                            Some(id) => {
+                                // Find session by ID prefix in flint sessions
+                                let session_dir = &config.session.path;
+                                let flint_sessions = flint_agent::Session::list_sessions(session_dir)
+                                    .unwrap_or_default();
+                                let found_flint = flint_sessions.iter().find(|s| s.id.starts_with(&id));
+
+                                // Find session by ID prefix in Claude Code sessions
+                                let claude_sessions = session_import::list_claude_sessions(&working_dir)
+                                    .unwrap_or_default();
+                                let found_claude = claude_sessions.iter().find(|(_, m)| m.id.starts_with(&id));
+
+                                if let Some(meta) = found_flint {
+                                    let path = session_dir.join(format!("{}.json", meta.id));
+                                    match load_session(&path) {
+                                        Ok((loaded_session, loaded_meta)) => {
+                                            session = loaded_session;
+                                            current_session_meta = Some(loaded_meta.clone());
+                                            println!("Resumed session: {} ({})", loaded_meta.title, &loaded_meta.id[..8]);
+                                            println!("  Provider: {} / {}", loaded_meta.provider, loaded_meta.model);
+                                            println!("  Messages: {}\n", loaded_meta.message_count);
+                                        }
+                                        Err(e) => {
+                                            println!("Error loading session: {}\n", e);
+                                        }
+                                    }
+                                } else if let Some((path, _meta)) = found_claude {
+                                    match session_import::import_session(path) {
+                                        Ok((loaded_session, loaded_meta)) => {
+                                            session = loaded_session;
+                                            current_session_meta = Some(loaded_meta.clone());
+                                            println!("Resumed Claude Code session: {} ({})", loaded_meta.title, &loaded_meta.id[..8]);
+                                            println!("  Provider: {} / {}", loaded_meta.provider, loaded_meta.model);
+                                            println!("  Messages: {}\n", loaded_meta.message_count);
+                                        }
+                                        Err(e) => {
+                                            println!("Error loading Claude Code session: {}\n", e);
+                                        }
+                                    }
+                                } else {
+                                    println!("Session not found: {}\n", id);
+                                }
+                            }
+                            None => {
+                                print_resume_sessions(&config, &working_dir);
+                            }
+                        }
                     }
                     SlashAction::Config => {
                         cmd_config(&working_dir)?;
@@ -781,6 +896,36 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             {
                 eprintln!("\n\x1b[31m\u{26a0} Error:\x1b[0m {}", e);
                 eprintln!("  Type /setup to reconfigure provider, or /model to switch model.\n");
+            }
+
+            // Auto-save session after each turn
+            if config.session.persistence && !session.is_empty() {
+                let session_dir = &config.session.path;
+                if !session_dir.exists() {
+                    let _ = std::fs::create_dir_all(session_dir);
+                }
+
+                match &current_session_meta {
+                    Some(meta) => {
+                        // Update existing session
+                        let path = session_dir.join(format!("{}.json", meta.id));
+                        if let Err(e) = session.update_save(&path, meta) {
+                            eprintln!("Warning: Failed to save session: {}", e);
+                        }
+                    }
+                    None => {
+                        // Save new session
+                        let path = session_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+                        if let Err(e) = session.save(&path, &config.provider.r#type, &config.provider.model) {
+                            eprintln!("Warning: Failed to save session: {}", e);
+                        } else {
+                            // Load the meta for future updates
+                            if let Ok((_, meta)) = flint_agent::Session::load(&path) {
+                                current_session_meta = Some(meta);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
