@@ -292,15 +292,50 @@ pub fn list_claude_sessions(project_path: &Path) -> Result<Vec<(std::path::PathB
         if dir_name == sanitized || dir_name.starts_with(&sanitized) {
             let dir_path = entry.path();
 
-            // List JSONL files
-            for file_entry in std::fs::read_dir(&dir_path)? {
-                let file_entry = file_entry?;
-                let file_path = file_entry.path();
+            // Try sessions-index.json first (faster)
+            let index_path = dir_path.join("sessions-index.json");
+            if index_path.exists() {
+                if let Ok(sessions_from_index) = list_sessions_from_index(&index_path, &dir_path) {
+                    sessions.extend(sessions_from_index);
+                }
+            }
 
-                if file_path.extension().map_or(false, |e| e == "jsonl") {
-                    if let Ok((_, meta)) = import_claude_code(&file_path) {
-                        sessions.push((file_path, meta));
+            // Fallback to scanning JSONL files
+            if sessions.is_empty() {
+                for file_entry in std::fs::read_dir(&dir_path)? {
+                    let file_entry = file_entry?;
+                    let file_path = file_entry.path();
+
+                    if file_path.extension().map_or(false, |e| e == "jsonl") {
+                        if let Ok((_, meta)) = import_claude_code(&file_path) {
+                            sessions.push((file_path, meta));
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    // Also scan all project directories for JSONL files (like jcode does)
+    for entry in std::fs::read_dir(&claude_projects)? {
+        let entry = entry?;
+        let dir_path = entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+
+        for file_entry in std::fs::read_dir(&dir_path)? {
+            let file_entry = file_entry?;
+            let file_path = file_entry.path();
+
+            if file_path.extension().map_or(false, |e| e == "jsonl") {
+                // Skip if already found
+                if sessions.iter().any(|(p, _)| p == &file_path) {
+                    continue;
+                }
+
+                if let Ok((_, meta)) = import_claude_code(&file_path) {
+                    sessions.push((file_path, meta));
                 }
             }
         }
@@ -308,6 +343,58 @@ pub fn list_claude_sessions(project_path: &Path) -> Result<Vec<(std::path::PathB
 
     // Sort by updated_at descending
     sessions.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+
+    Ok(sessions)
+}
+
+/// List sessions from Claude Code sessions-index.json
+fn list_sessions_from_index(index_path: &Path, project_dir: &Path) -> Result<Vec<(std::path::PathBuf, SessionMeta)>> {
+    let content = std::fs::read_to_string(index_path)?;
+    let index: serde_json::Value = serde_json::from_str(&content)?;
+
+    let mut sessions = Vec::new();
+
+    if let Some(entries) = index.get("entries").and_then(|e| e.as_array()) {
+        for entry in entries {
+            // Skip sidechain sessions
+            if entry.get("is_sidechain").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+
+            let session_id = entry.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            let jsonl_path = project_dir.join(format!("{}.jsonl", session_id));
+
+            if !jsonl_path.exists() {
+                continue;
+            }
+
+            let first_prompt = entry.get("first_prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let summary = entry.get("summary").and_then(|v| v.as_str());
+            let created = entry.get("created").and_then(|v| v.as_str()).unwrap_or("");
+            let modified = entry.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+            let message_count = entry.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            let title = if !first_prompt.is_empty() {
+                first_prompt.chars().take(50).collect::<String>()
+            } else if let Some(s) = summary {
+                s.chars().take(50).collect::<String>()
+            } else {
+                format!("Session {}", &session_id[..8.min(session_id.len())])
+            };
+
+            let meta = SessionMeta {
+                id: session_id.to_string(),
+                created_at: created.to_string(),
+                updated_at: modified.to_string(),
+                provider: "claude-code".to_string(),
+                model: String::new(), // Will be filled on import
+                title,
+                message_count,
+            };
+
+            sessions.push((jsonl_path, meta));
+        }
+    }
 
     Ok(sessions)
 }
