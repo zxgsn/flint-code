@@ -84,6 +84,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/setup", "Configure provider"),
     ("/model", "Switch model"),
     ("/skills", "List skills"),
+    ("/mcp", "MCP server status"),
+    ("/resume", "Restore saved session"),
+    ("/compact", "Compress history"),
     ("/clear", "Clear session"),
     ("/status", "Show status"),
     ("/help", "Show help"),
@@ -110,9 +113,13 @@ fn read_line_inner() -> Result<InputResult> {
     let mut completion_lines: u16 = 0;
     let mut tab_index: usize = 0;
     let mut undo_stack: Vec<(String, usize)> = Vec::new();
+    // Paste detection: count consecutive rapid characters.
+    // Normal typing has pauses (arrows, tab, etc. reset this).
+    // Pasting sends many chars without interruption.
+    let mut rapid_char_count: u32 = 0;
 
     // Record the input row once at the start
-    let (_, start_row) = crossterm::cursor::position()?;
+    let (_, mut start_row) = crossterm::cursor::position()?;
 
     loop {
         if let Event::Key(KeyEvent {
@@ -156,19 +163,33 @@ fn read_line_inner() -> Result<InputResult> {
                     }
                     ctrl_c_count = 0;
                 }
-                // Enter — submit
+                // Enter — submit (or insert newline in paste mode)
                 (KeyCode::Enter, _) => {
-                    clear_used_lines(start_row, completion_lines)?;
-                    let mut stdout = std::io::stdout();
-                    execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
-                    execute!(
-                        stdout,
-                        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
-                    )?;
-                    write!(stdout, "\u{276f} {}", buf)?;
-                    stdout.flush()?;
-                    add_to_history(&buf);
-                    return Ok(InputResult::Line(buf));
+                    let is_paste = rapid_char_count > 10;
+                    rapid_char_count = 0;
+                    if is_paste {
+                        // Pasted content with newlines: insert literally
+                        undo_stack.push((buf.clone(), cursor_pos));
+                        if !buf.is_char_boundary(cursor_pos) {
+                            cursor_pos = buf.len();
+                        }
+                        buf.insert(cursor_pos, '\n');
+                        cursor_pos += 1;
+                        tab_index = 0;
+                        render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                    } else {
+                        clear_used_lines(start_row, completion_lines)?;
+                        let mut stdout = std::io::stdout();
+                        execute!(stdout, crossterm::cursor::MoveTo(0, start_row))?;
+                        execute!(
+                            stdout,
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+                        )?;
+                        write!(stdout, "\u{276f} {}", buf)?;
+                        stdout.flush()?;
+                        add_to_history(&buf);
+                        return Ok(InputResult::Line(buf));
+                    }
                 }
                 // Up arrow — previous history
                 (KeyCode::Up, _) => {
@@ -282,9 +303,9 @@ fn read_line_inner() -> Result<InputResult> {
                     let mut stdout = std::io::stdout();
                     execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
                     execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
-                    // Re-render input at top
-                    let (_, new_row) = crossterm::cursor::position()?;
-                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, new_row)?;
+                    // Re-render input at top and update start_row
+                    start_row = 0;
+                    render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
                 }
                 // Ctrl+Z — undo
@@ -299,6 +320,8 @@ fn read_line_inner() -> Result<InputResult> {
                 }
                 // Regular character
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                    rapid_char_count += 1;
+
                     // Ensure cursor_pos is at a valid char boundary
                     if !buf.is_char_boundary(cursor_pos) {
                         cursor_pos = buf.len();
@@ -321,9 +344,11 @@ fn read_line_inner() -> Result<InputResult> {
                     tab_index = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 (KeyCode::Esc, _) => {
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 _ => {}
             }

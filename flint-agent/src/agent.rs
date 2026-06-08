@@ -10,6 +10,8 @@ use flint_provider::Provider;
 use flint_types::StreamEvent;
 use futures::StreamExt;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::session::Session;
@@ -52,25 +54,82 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
+/// Strip ANSI escape sequences and normalize line endings for safe terminal display.
+fn sanitize_preview(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ANSI escape sequence: ESC [ ... letter
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() || next == 'm' {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\r' {
+            // Normalize \r\n → \n, lone \r → \n
+            if chars.peek() != Some(&'\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Statistics collected during a turn.
+#[derive(Debug, Clone, Default)]
+pub struct TurnStats {
+    pub llm_calls: u32,
+    pub tool_calls: u32,
+    pub total_chars: usize,
+}
+
 /// Run a single agent turn: send messages to the provider, stream the response,
 /// execute any tool calls, and loop until the LLM produces a final text response.
 ///
-/// Returns the assistant's final text response.
+/// Returns the assistant's final text response and turn statistics.
 pub async fn run_turn(
     provider: &dyn Provider,
     session: &mut Session,
     registry: &ToolRegistry,
     system: &str,
     ctx: &ToolContext,
-) -> Result<String> {
+    max_turns: u32,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(String, TurnStats)> {
     let turn_start = Instant::now();
     let mut turn_iter = 0u32;
+    let mut stats = TurnStats::default();
 
     loop {
         turn_iter += 1;
 
+        // Check max_turns limit
+        if turn_iter > max_turns {
+            eprintln!(
+                "{}",
+                yellow(&format!(
+                    "  ── max turns ({}) reached, stopping ──",
+                    max_turns
+                ))
+            );
+            break;
+        }
+
+        // Check cancellation
+        if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            eprintln!("{}", yellow("  ── interrupted by user ──"));
+            break;
+        }
+
         // Show thinking indicator
-        print!("\r\x1b[K{} {}", cyan("⟳"), dim("Thinking..."));
+        print!("\r\x1b[K{} {}", cyan("~"), dim("Thinking..."));
         std::io::stdout().flush()?;
 
         let api_start = Instant::now();
@@ -122,6 +181,8 @@ pub async fn run_turn(
         // No tool calls → turn is done
         if tool_calls.is_empty() {
             session.add_assistant(&text);
+            stats.llm_calls = turn_iter;
+            stats.total_chars = token_count;
             let total_elapsed = turn_start.elapsed();
             println!();
             // Turn footer with stats
@@ -137,14 +198,15 @@ pub async fn run_turn(
                 eprintln!(
                     "{}",
                     dim(&format!(
-                        "  ── turn complete · {} · {} chars ──",
+                        "  ── turn complete · {} · {} chars · {} tool calls ──",
                         format_elapsed(total_elapsed),
-                        token_count
+                        token_count,
+                        stats.tool_calls
                     ))
                 );
             }
             println!();
-            return Ok(text);
+            return Ok((text, stats));
         }
 
         // Has tool calls → execute them and loop
@@ -164,10 +226,16 @@ pub async fn run_turn(
         );
 
         for tc in tool_calls.iter() {
+            // Check cancellation before each tool call
+            if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                eprintln!("{}", yellow("  ── interrupted, skipping remaining tools ──"));
+                break;
+            }
+
             let tool_start = Instant::now();
             print!(
                 "  {} {}",
-                yellow("⚙"),
+                yellow("*"),
                 bold(&tc.name)
             );
             // Show input preview for key tools
@@ -183,7 +251,7 @@ pub async fn run_turn(
                         serde_json::Value::String(s) => {
                             let preview: String = s.chars().take(60).collect();
                             if preview.len() < s.len() {
-                                format!("{}…", preview)
+                                format!("{}...", preview)
                             } else {
                                 preview
                             }
@@ -192,7 +260,7 @@ pub async fn run_turn(
                             let s = other.to_string();
                             let preview: String = s.chars().take(60).collect();
                             if preview.len() < s.len() {
-                                format!("{}…", preview)
+                                format!("{}...", preview)
                             } else {
                                 preview
                             }
@@ -206,26 +274,34 @@ pub async fn run_turn(
 
             let output = registry.execute(&tc.name, tc.input.clone(), ctx).await?;
             let tool_elapsed = tool_start.elapsed();
+            stats.tool_calls += 1;
 
-            let preview: String = output.text.chars().take(200).collect();
-            let truncated = if output.text.len() > 200 { "…" } else { "" };
+            let sanitized = sanitize_preview(&output.text);
+            let preview: String = sanitized.chars().take(200).collect();
+            let truncated = if sanitized.len() > 200 { "..." } else { "" };
             if output.is_error {
                 println!(
                     "  {} {} {}",
-                    red("✗"),
+                    red("x"),
                     preview,
                     dim(&format!("({})", format_elapsed(tool_elapsed)))
                 );
             } else {
                 println!(
                     "  {} {}{} {}",
-                    green("✓"),
+                    green("+"),
                     preview,
                     truncated,
                     dim(&format!("({})", format_elapsed(tool_elapsed)))
                 );
             }
             session.add_tool_result(&tc.id, &output);
+        }
+
+        // If cancelled during tool execution, break the outer loop
+        if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            eprintln!("{}", yellow("  ── interrupted by user ──"));
+            break;
         }
 
         // Separator between tool execution and next LLM call
@@ -242,4 +318,8 @@ pub async fn run_turn(
         );
         println!();
     }
+
+    // Reached via break (max_turns or cancel) — return what we have
+    stats.llm_calls = turn_iter;
+    Ok((String::new(), stats))
 }

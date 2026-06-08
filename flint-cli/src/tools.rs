@@ -103,8 +103,10 @@ impl Tool for BashTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'command'"))?;
 
         let output = if cfg!(target_os = "windows") {
+            // chcp 65001 forces UTF-8 output from cmd.exe, avoiding GBK mojibake
+            let wrapped = format!("chcp 65001 >nul && {}", command);
             std::process::Command::new("cmd")
-                .args(["/C", command])
+                .args(["/C", &wrapped])
                 .current_dir(&ctx.working_dir)
                 .output()?
         } else {

@@ -99,22 +99,31 @@ impl SetupApp {
 
     fn select_provider(&mut self, idx: usize) {
         let p = &PROVIDERS[idx];
+        // Pre-populate from current environment variables
+        let current_key = std::env::var(p.env_key).unwrap_or_default();
+        let current_base = std::env::var(p.env_base).ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| p.default_base.to_string());
+        let current_model = std::env::var(p.env_model).ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| p.default_model.to_string());
+
         self.fields = vec![
             InputField {
                 label: "API Key",
-                value: String::new(),
+                value: current_key,
                 is_secret: true,
                 placeholder: "sk-...",
             },
             InputField {
                 label: "Base URL",
-                value: p.default_base.to_string(),
+                value: current_base,
                 is_secret: false,
                 placeholder: p.default_base,
             },
             InputField {
                 label: "Model",
-                value: p.default_model.to_string(),
+                value: current_model,
                 is_secret: false,
                 placeholder: p.default_model,
             },

@@ -32,3 +32,4 @@ uuid           = { version = "1", features = ["v4"] }
 dirs           = "5"
 dunce          = "1"
 enable-ansi-support = "0.2"
+ctrlc          = "3"
