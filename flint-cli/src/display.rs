@@ -13,6 +13,9 @@ Built-in commands:
   /skills       List available skills
   /skill <name> Load and show a specific skill
   /mcp          Show MCP server status and tools
+  /memory       Show memory status
+  /memory list  List all stored memories
+  /memory core  Show core memory blocks
   /resume       List saved sessions (flint + Claude Code)
   /resume <id>  Restore a saved session
   /compact      Compress conversation history
@@ -36,7 +39,12 @@ Keyboard shortcuts:
 Anything else is sent to the LLM as a message.
 
 Skills are auto-injected when your message matches a skill name or description.
-You can also explicitly request a skill with [use: <skill-name>] in your message."
+You can also explicitly request a skill with [use: <skill-name>] in your message.
+
+Memory tools (when memory is enabled):
+  memory_remember, memory_forget, memory_search, memory_list, memory_update_core
+Core memory blocks are always visible to the LLM in the system prompt.
+Archival memories are automatically searched and injected for relevant queries."
     );
 }
 

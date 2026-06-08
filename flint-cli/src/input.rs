@@ -19,29 +19,93 @@ pub enum InputResult {
     Exit,
 }
 
-// ── History ────────────────────────────────────────────────────────────────
+// ── History (persistent) ───────────────────────────────────────────────────
+
+/// Maximum number of history entries to keep on disk.
+const MAX_HISTORY: usize = 1000;
 
 struct HistoryState {
     lines: Vec<String>,
     index: Option<usize>,
+    loaded: bool,
 }
 
 static HISTORY: Mutex<HistoryState> = Mutex::new(HistoryState {
     lines: Vec::new(),
     index: None,
+    loaded: false,
 });
+
+/// Path to the history file: `~/.flint/history`
+fn history_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".flint").join("history"))
+}
+
+/// Load history from disk on first access.
+fn ensure_loaded() {
+    let mut state = HISTORY.lock().unwrap();
+    if state.loaded {
+        return;
+    }
+    state.loaded = true;
+
+    if let Some(path) = history_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            state.lines = content
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect();
+            // Trim to MAX_HISTORY from the front (keep most recent)
+            if state.lines.len() > MAX_HISTORY {
+                let drain = state.lines.len() - MAX_HISTORY;
+                state.lines.drain(..drain);
+            }
+        }
+    }
+}
+
+/// Append a single line to the history file.
+fn append_to_file(line: &str) {
+    if let Some(path) = history_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Read existing, append, trim, write back
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .ok()
+            .map(|c| c.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+
+        // Remove duplicate
+        lines.retain(|h| h != line);
+        lines.push(line.to_string());
+
+        // Trim
+        if lines.len() > MAX_HISTORY {
+            let drain = lines.len() - MAX_HISTORY;
+            lines.drain(..drain);
+        }
+
+        let _ = std::fs::write(path, lines.join("\n"));
+    }
+}
 
 fn add_to_history(line: &str) {
     if !line.trim().is_empty() {
-        let mut state = HISTORY.lock().unwrap();
-        // Remove duplicate if exists
-        state.lines.retain(|h| h != line);
-        state.lines.push(line.to_string());
-        state.index = None;
+        ensure_loaded();
+        {
+            let mut state = HISTORY.lock().unwrap();
+            state.lines.retain(|h| h != line);
+            state.lines.push(line.to_string());
+            state.index = None;
+        }
+        append_to_file(line);
     }
 }
 
 fn get_prev_history() -> Option<String> {
+    ensure_loaded();
     let mut state = HISTORY.lock().unwrap();
     if state.lines.is_empty() {
         return None;
@@ -62,6 +126,7 @@ fn get_prev_history() -> Option<String> {
 }
 
 fn get_next_history() -> Option<String> {
+    ensure_loaded();
     let mut state = HISTORY.lock().unwrap();
     match state.index {
         Some(i) => {
@@ -85,6 +150,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model"),
     ("/skills", "List skills"),
     ("/mcp", "MCP server status"),
+    ("/memory", "Memory status"),
     ("/resume", "Restore saved session"),
     ("/compact", "Compress history"),
     ("/clear", "Clear session"),
@@ -92,6 +158,75 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
     ("/quit", "Exit"),
 ];
+
+// ── Path completion ────────────────────────────────────────────────────────
+
+/// Extract the partial path token at the cursor position for completion.
+/// Returns (prefix_before_path, partial_path) if the cursor is on a path-like token.
+fn extract_path_token(buf: &str, cursor_pos: usize) -> Option<(String, String)> {
+    // Find the start of the current "word" (space-delimited, but include path separators)
+    let before = &buf[..cursor_pos];
+    let word_start = before.rfind(|c: char| c == ' ' || c == '\t').map(|i| i + 1).unwrap_or(0);
+    let word = &buf[word_start..cursor_pos];
+
+    if word.is_empty() {
+        return None;
+    }
+
+    // Check if it looks like a path: contains / or \ or starts with . or ~
+    let looks_like_path = word.contains('/') || word.contains('\\')
+        || word.starts_with('.') || word.starts_with('~');
+
+    if !looks_like_path {
+        return None;
+    }
+
+    Some((buf[..word_start].to_string(), word.to_string()))
+}
+
+/// Get filesystem path completions for a partial path.
+fn get_path_completions(partial: &str, working_dir: &std::path::Path) -> Vec<String> {
+    let (dir_part, file_prefix) = if let Some(pos) = partial.rfind(|c: char| c == '/' || c == '\\') {
+        (&partial[..pos + 1], &partial[pos + 1..])
+    } else {
+        (".", partial)
+    };
+
+    let search_dir = if dir_part.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&dir_part[2..]) // strip "~/"
+        } else {
+            return Vec::new();
+        }
+    } else if dir_part.starts_with('.') || dir_part.starts_with('/') || dir_part.len() > 1 && dir_part.as_bytes()[1] == b':' {
+        std::path::PathBuf::from(dir_part)
+    } else {
+        working_dir.join(dir_part)
+    };
+
+    let mut results = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(file_prefix) && !name.starts_with('.') {
+                let path = entry.path();
+                let display = if dir_part == "." {
+                    name.clone()
+                } else {
+                    format!("{}{}", dir_part, name)
+                };
+                if path.is_dir() {
+                    results.push(format!("{}/", display));
+                } else {
+                    results.push(display);
+                }
+            }
+        }
+    }
+
+    results.sort();
+    results
+}
 
 // ── Public entry point ─────────────────────────────────────────────────────
 
@@ -149,13 +284,26 @@ fn read_line_inner() -> Result<InputResult> {
                     cursor_pos = 0;
                     completion_lines = 0;
                 }
-                // Tab — cycle through matching completions
+                // Tab — cycle through matching completions (slash commands or paths)
                 (KeyCode::Tab, _) => {
                     if buf.starts_with('/') {
+                        // Slash command completion
                         let matches = get_completions(&buf);
                         if !matches.is_empty() {
                             tab_index = tab_index % matches.len();
                             buf = matches[tab_index].to_string();
+                            cursor_pos = buf.len();
+                            tab_index += 1;
+                            render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+                        }
+                    } else if let Some((prefix, partial)) = extract_path_token(&buf, cursor_pos) {
+                        // Path completion
+                        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        let matches = get_path_completions(&partial, &cwd);
+                        if !matches.is_empty() {
+                            tab_index = tab_index % matches.len();
+                            let completed = format!("{}{}", prefix, matches[tab_index]);
+                            buf = completed;
                             cursor_pos = buf.len();
                             tab_index += 1;
                             render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;

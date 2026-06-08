@@ -1,11 +1,13 @@
 //! Built-in tools for flint.
 //!
-//! These tools are always available to the agent: read, write, bash, grep, glob.
+//! Core tools are always available: read, write, bash, grep, glob.
+//! Memory tools are registered when the memory feature is enabled.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use flint_agent::{Tool, ToolContext, ToolRegistry};
 use flint_types::{ToolDefinition, ToolOutput};
+use std::sync::{Arc, Mutex};
 
 // ── Read ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +76,91 @@ impl Tool for WriteTool {
         }
         std::fs::write(&full, content)?;
         Ok(ToolOutput::text(format!("wrote {}", full.display())))
+    }
+}
+
+// ── Edit ───────────────────────────────────────────────────────────────────
+
+pub struct EditTool;
+
+#[async_trait]
+impl Tool for EditTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "edit".into(),
+            description: "Replace text in a file. Input: {\"path\": \"...\", \"old_string\": \"...\", \"new_string\": \"...\", \"replace_all\": false}. \
+                old_string must be unique in the file unless replace_all is true."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path to edit" },
+                    "old_string": { "type": "string", "description": "Exact text to find and replace" },
+                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)", "default": false }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
+        let path = input["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
+        let old_string = input["old_string"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'old_string'"))?;
+        let new_string = input["new_string"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'new_string'"))?;
+        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+
+        if old_string.is_empty() {
+            return Ok(ToolOutput::error("old_string cannot be empty"));
+        }
+
+        let full = ctx.working_dir.join(path);
+        let content = match std::fs::read_to_string(&full) {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolOutput::error(format!("{}: {}", full.display(), e))),
+        };
+
+        let count = content.matches(old_string).count();
+
+        if count == 0 {
+            return Ok(ToolOutput::error(format!(
+                "old_string not found in {}",
+                full.display()
+            )));
+        }
+
+        if !replace_all && count > 1 {
+            return Ok(ToolOutput::error(format!(
+                "old_string found {} times in {}. Must be unique. Use replace_all=true or provide more context.",
+                count,
+                full.display()
+            )));
+        }
+
+        let new_content = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+
+        std::fs::write(&full, &new_content)?;
+
+        let action = if replace_all {
+            format!("replaced {} occurrence(s)", count)
+        } else {
+            "replaced 1 occurrence".to_string()
+        };
+        Ok(ToolOutput::text(format!(
+            "edited {}: {}",
+            full.display(),
+            action
+        )))
     }
 }
 
@@ -219,13 +306,423 @@ impl Tool for GlobTool {
     }
 }
 
+// ── Web Fetch ──────────────────────────────────────────────────────────────
+
+pub struct WebFetchTool;
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "web_fetch".into(),
+            description: "Fetch a URL and return its content as text. Input: {\"url\": \"...\", \"max_chars\": 50000}".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch" },
+                    "max_chars": { "type": "integer", "description": "Max characters to return (default 50000)", "default": 50000 }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let url = input["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'url'"))?;
+
+        let max_chars = input["max_chars"].as_u64().unwrap_or(50000) as usize;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()?;
+
+        let resp = client.get(url).send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Ok(ToolOutput::error(format!(
+                "HTTP {} for {}",
+                status.as_u16(),
+                url
+            )));
+        }
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body = resp.text().await?;
+
+        // Basic HTML to text conversion
+        let text = if content_type.contains("html") {
+            html_to_text(&body)
+        } else {
+            body
+        };
+
+        if text.len() > max_chars {
+            Ok(ToolOutput::text(format!(
+                "{}\n\n[truncated — {} chars total]",
+                &text[..max_chars],
+                text.len()
+            )))
+        } else {
+            Ok(ToolOutput::text(text))
+        }
+    }
+}
+
+/// Basic HTML to text conversion — strips tags, decodes common entities.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+            }
+            '>' => {
+                in_tag = false;
+                continue;
+            }
+            _ if in_tag => continue,
+            _ => {}
+        }
+
+        if !in_tag {
+            out.push(c);
+        }
+    }
+
+    // Decode common HTML entities
+    out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ")
+        .replace("&#39;", "'");
+
+    // Collapse multiple newlines/spaces
+    let mut result = String::new();
+    let mut prev_newline = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_newline {
+                result.push('\n');
+                prev_newline = true;
+            }
+        } else {
+            result.push_str(trimmed);
+            result.push('\n');
+            prev_newline = false;
+        }
+    }
+
+    result
+}
+
+// ── Memory Tools ───────────────────────────────────────────────────────────
+
+type SharedMemory = Arc<Mutex<flint_memory::MemoryManager>>;
+
+// ── memory_remember ────────────────────────────────────────────────────────
+
+pub struct MemoryRememberTool {
+    pub memory: SharedMemory,
+}
+
+#[async_trait]
+impl Tool for MemoryRememberTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_remember".into(),
+            description: "Save a fact, preference, correction, or pattern to long-term memory. \
+                Input: {\"content\": \"...\", \"category\": \"fact|preference|correction|pattern\", \
+                \"tags\": [\"...\"], \"scope\": \"project|global\"}"
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "The fact or information to remember" },
+                    "category": { "type": "string", "description": "Category: fact, preference, correction, pattern", "default": "fact" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for searchability" },
+                    "scope": { "type": "string", "description": "project (default) or global", "default": "project" }
+                },
+                "required": ["content"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'content'"))?;
+
+        let category = flint_memory::MemoryCategory::from_str_loose(
+            input["category"].as_str().unwrap_or("fact"),
+        );
+
+        let tags: Vec<String> = input["tags"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let scope = match input["scope"].as_str().unwrap_or("project") {
+            "global" => flint_memory::MemoryScope::Global,
+            _ => flint_memory::MemoryScope::Project,
+        };
+
+        let mut mm = self.memory.lock().unwrap();
+        match mm.remember(content, category, tags, scope, flint_memory::TrustLevel::Medium) {
+            Ok(id) => Ok(ToolOutput::text(format!("remembered: {} ({})", content, id))),
+            Err(e) => Ok(ToolOutput::error(format!("failed to remember: {}", e))),
+        }
+    }
+}
+
+// ── memory_forget ──────────────────────────────────────────────────────────
+
+pub struct MemoryForgetTool {
+    pub memory: SharedMemory,
+}
+
+#[async_trait]
+impl Tool for MemoryForgetTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_forget".into(),
+            description: "Remove a memory by ID. Input: {\"id\": \"mem_...\"}".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Memory ID to forget" }
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let id = input["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'id'"))?;
+
+        let mut mm = self.memory.lock().unwrap();
+        match mm.forget(id) {
+            Ok(true) => Ok(ToolOutput::text(format!("forgotten: {}", id))),
+            Ok(false) => Ok(ToolOutput::text(format!("memory not found: {}", id))),
+            Err(e) => Ok(ToolOutput::error(format!("failed to forget: {}", e))),
+        }
+    }
+}
+
+// ── memory_search ──────────────────────────────────────────────────────────
+
+pub struct MemorySearchTool {
+    pub memory: SharedMemory,
+}
+
+#[async_trait]
+impl Tool for MemorySearchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_search".into(),
+            description: "Search long-term memories by keyword. \
+                Input: {\"query\": \"...\", \"scope\": \"all|project|global\", \"limit\": 5}"
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "scope": { "type": "string", "description": "all (default), project, or global", "default": "all" },
+                    "limit": { "type": "integer", "description": "Max results (default 5)", "default": 5 }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let query = input["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'query'"))?;
+
+        let scope = match input["scope"].as_str().unwrap_or("all") {
+            "project" => Some(flint_memory::MemoryScope::Project),
+            "global" => Some(flint_memory::MemoryScope::Global),
+            _ => None,
+        };
+
+        let limit = input["limit"].as_u64().unwrap_or(5) as usize;
+
+        let mut mm = self.memory.lock().unwrap();
+        let results = mm.search(query, scope, Some(limit));
+
+        if results.is_empty() {
+            return Ok(ToolOutput::text("no memories found matching query"));
+        }
+
+        let mut output = String::new();
+        for (i, result) in results.iter().enumerate() {
+            let trust_label = match result.entry.trust {
+                flint_memory::TrustLevel::High => "high",
+                flint_memory::TrustLevel::Medium => "med",
+                flint_memory::TrustLevel::Low => "low",
+            };
+            output.push_str(&format!(
+                "{}. [{}][{}][{}] {} (id: {}, score: {:.2})\n",
+                i + 1,
+                result.entry.category,
+                result.entry.scope,
+                trust_label,
+                result.entry.content,
+                result.entry.id,
+                result.score
+            ));
+        }
+
+        Ok(ToolOutput::text(output))
+    }
+}
+
+// ── memory_list ────────────────────────────────────────────────────────────
+
+pub struct MemoryListTool {
+    pub memory: SharedMemory,
+}
+
+#[async_trait]
+impl Tool for MemoryListTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_list".into(),
+            description: "List all stored memories. \
+                Input: {\"scope\": \"all|project|global\"}"
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "all (default), project, or global", "default": "all" }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let scope = match input["scope"].as_str().unwrap_or("all") {
+            "project" => Some(flint_memory::MemoryScope::Project),
+            "global" => Some(flint_memory::MemoryScope::Global),
+            _ => None,
+        };
+
+        let mm = self.memory.lock().unwrap();
+        let entries = mm.list(scope);
+
+        if entries.is_empty() {
+            return Ok(ToolOutput::text("no memories stored"));
+        }
+
+        let mut output = format!("{} memories:\n", entries.len());
+        for entry in &entries {
+            output.push_str(&format!(
+                "- [{}][{}] {} (id: {}, accessed: {}x)\n",
+                entry.category, entry.scope, entry.content, entry.id, entry.access_count
+            ));
+        }
+
+        Ok(ToolOutput::text(output))
+    }
+}
+
+// ── memory_update_core ─────────────────────────────────────────────────────
+
+pub struct MemoryUpdateCoreTool {
+    pub memory: SharedMemory,
+}
+
+#[async_trait]
+impl Tool for MemoryUpdateCoreTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_update_core".into(),
+            description: "Update a core memory block (always visible in system prompt). \
+                Input: {\"label\": \"persona|user|project|...\", \"content\": \"...\"}"
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "description": "Block label (e.g. persona, user, project)" },
+                    "content": { "type": "string", "description": "New content for the block" }
+                },
+                "required": ["label", "content"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let label = input["label"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'label'"))?;
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'content'"))?;
+
+        let mut mm = self.memory.lock().unwrap();
+        match mm.update_core(label, content) {
+            Ok(true) => Ok(ToolOutput::text(format!(
+                "updated core block '{}'",
+                label
+            ))),
+            Ok(false) => Ok(ToolOutput::error(format!(
+                "failed to update block '{}' (read-only or too long)",
+                label
+            ))),
+            Err(e) => Ok(ToolOutput::error(format!("failed to update core: {}", e))),
+        }
+    }
+}
+
 // ── Registration helper ────────────────────────────────────────────────────
 
 /// Register all built-in tools into the registry.
 pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(ReadTool);
     registry.register(WriteTool);
+    registry.register(EditTool);
     registry.register(BashTool);
     registry.register(GrepTool);
     registry.register(GlobTool);
+    registry.register(WebFetchTool);
+}
+
+/// Register memory tools into the registry (when memory feature is enabled).
+pub fn register_memory_tools(registry: &mut ToolRegistry, memory: SharedMemory) {
+    registry.register(MemoryRememberTool {
+        memory: memory.clone(),
+    });
+    registry.register(MemoryForgetTool {
+        memory: memory.clone(),
+    });
+    registry.register(MemorySearchTool {
+        memory: memory.clone(),
+    });
+    registry.register(MemoryListTool {
+        memory: memory.clone(),
+    });
+    registry.register(MemoryUpdateCoreTool {
+        memory,
+    });
 }

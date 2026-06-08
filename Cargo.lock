@@ -486,10 +486,12 @@ dependencies = [
  "flint-agent",
  "flint-config",
  "flint-mcp",
+ "flint-memory",
  "flint-provider",
  "flint-types",
  "glob",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -523,6 +525,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flint-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

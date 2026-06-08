@@ -6,7 +6,7 @@ use flint_mcp::McpManager;
 use flint_provider::Provider;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::display;
 use crate::provider;
@@ -23,6 +23,7 @@ pub enum SlashAction {
     Status,
     Skills,
     Mcp,
+    Memory(Option<String>),
     Resume(Option<String>),
     Quit,
     Unknown(String),
@@ -52,6 +53,10 @@ pub fn parse(input: &str) -> Option<SlashAction> {
         "status" => SlashAction::Status,
         "skills" => SlashAction::Skills,
         "mcp" => SlashAction::Mcp,
+        "memory" | "mem" => {
+            let arg = input[1..].split_whitespace().nth(1);
+            SlashAction::Memory(arg.map(|s| s.to_string()))
+        }
         "resume" => {
             let arg = input[1..].split_whitespace().nth(1);
             SlashAction::Resume(arg.map(|s| s.to_string()))
@@ -72,6 +77,7 @@ pub struct SlashContext<'a> {
     pub cancel: &'a Arc<AtomicBool>,
     pub mcp_manager: &'a mut McpManager,
     pub working_dir: &'a Path,
+    pub memory: &'a Option<Arc<Mutex<flint_memory::MemoryManager>>>,
     pub turn_count: u32,
     pub total_tool_calls: u32,
 }
@@ -150,6 +156,9 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
                 display::print_skills(sc.config, sc.working_dir);
             }
         },
+        SlashAction::Memory(sub) => {
+            dispatch_memory(sub, sc);
+        }
         SlashAction::Unknown(cmd) => {
             println!(
                 "Unknown command: /{}\nType /help for available commands.\n",
@@ -198,6 +207,7 @@ async fn dispatch_compact(sc: &mut SlashContext<'_>) -> Result<()> {
         sc.ctx,
         5,
         None,
+        65536,
     )
     .await
     {
@@ -385,4 +395,86 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
         },
     }
     Ok(())
+}
+
+/// /memory — show memory status, list, search, or edit core blocks
+fn dispatch_memory(sub: Option<String>, sc: &mut SlashContext<'_>) {
+    let mem = match sc.memory {
+        Some(m) => m,
+        None => {
+            println!("Memory is disabled. Enable it in config: [features.memory] enabled = true\n");
+            return;
+        }
+    };
+
+    match sub.as_deref() {
+        Some("list") | Some("ls") => {
+            let mm = mem.lock().unwrap();
+            let entries = mm.list(None);
+            if entries.is_empty() {
+                println!("No memories stored.\n");
+                return;
+            }
+            println!("{} memories:\n", entries.len());
+            for entry in &entries {
+                println!(
+                    "  [{}][{}] {} (id: {}, accessed: {}x)",
+                    entry.category, entry.scope, entry.content, entry.id, entry.access_count
+                );
+            }
+            println!();
+        }
+        Some("core") => {
+            let mm = mem.lock().unwrap();
+            let blocks = mm.core_blocks();
+            if blocks.is_empty() {
+                println!("No core memory blocks.\n");
+                return;
+            }
+            println!("Core Memory Blocks:\n");
+            for block in blocks {
+                let ro = if block.read_only { " (read-only)" } else { "" };
+                println!("  [{}]{} (limit: {} chars)", block.label, ro, block.limit);
+                println!("  {}\n", block.content);
+            }
+        }
+        Some("help") => {
+            println!(
+                "\
+Memory commands:
+  /memory          Show memory status
+  /memory list     List all stored memories
+  /memory core     Show core memory blocks
+  /memory help     Show this help
+
+Memory tools (available to the agent):
+  memory_remember    Save a fact/preference/correction
+  memory_forget      Remove a memory by ID
+  memory_search      Search memories by keyword
+  memory_list        List all memories
+  memory_update_core Update a core memory block\n"
+            );
+        }
+        _ => {
+            // Default: show memory status
+            let mm = mem.lock().unwrap();
+            let (core, project, global) = mm.counts();
+            println!(
+                "\
+Memory Status:
+  Core blocks: {}
+  Project memories: {}
+  Global memories: {}
+  Total: {}
+
+Use /memory list to see all memories.
+Use /memory core to see core blocks.
+Use /memory help for all commands.\n",
+                core,
+                project,
+                global,
+                core + project + global
+            );
+        }
+    }
 }

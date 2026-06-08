@@ -33,6 +33,10 @@ pub struct AgentConfig {
     /// Truncate tool output beyond this many characters.
     #[serde(default = "default_max_output_chars")]
     pub max_output_chars: usize,
+    /// Approximate context window size in characters (~4 chars per token).
+    /// Used for auto-compaction. Default 500000 (~125k tokens).
+    #[serde(default = "default_context_window_chars")]
+    pub context_window_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +309,10 @@ fn default_max_output_chars() -> usize {
     65536
 }
 
+fn default_context_window_chars() -> usize {
+    500_000 // ~125k tokens
+}
+
 fn default_true() -> bool {
     true
 }
@@ -337,6 +345,7 @@ impl Default for AgentConfig {
             system_prompt: None,
             max_turns: default_max_turns(),
             max_output_chars: default_max_output_chars(),
+            context_window_chars: default_context_window_chars(),
         }
     }
 }

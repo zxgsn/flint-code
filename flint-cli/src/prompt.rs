@@ -13,7 +13,10 @@ You are flint -- a fast, focused coding agent.
 - If unsure, ask. Don't guess.
 
 ## Tools
-You have: read, write, bash, grep, glob. Use them. Don't simulate.
+You have: read, write, edit, bash, grep, glob, web_fetch. Use them. Don't simulate.
+- Use `edit` for targeted changes (old_string → new_string). Prefer over `write` for modifying existing files.
+- Use `write` only for creating new files or full rewrites.
+- Use `web_fetch` to fetch URLs and read documentation.
 
 ## Working Directory
 All file operations are relative to the working directory provided. Stay within it.
@@ -40,7 +43,7 @@ fn detect_os() -> &'static str {
     }
 }
 
-/// Build system prompt with environment info and skill metadata (progressive disclosure).
+/// Build system prompt with environment info, skill metadata, and core memory.
 pub fn build_system_prompt(
     base: &str,
     config: &flint_config::Config,
@@ -56,35 +59,48 @@ pub fn build_system_prompt(
         working_dir.display(),
     ));
 
-    if !config.features.is_enabled(Feature::Skills) {
-        return prompt;
-    }
+    if config.features.is_enabled(Feature::Skills) {
+        let metas = config.load_skill_metas(Some(working_dir));
+        if !metas.is_empty() {
+            prompt.push_str("\n\n## Available Skills\n\n");
+            prompt.push_str("The following skills are available. To use a skill, say ");
+            prompt.push_str("`[use: <skill-name>]` in your response.\n\n");
 
-    let metas = config.load_skill_metas(Some(working_dir));
-    if metas.is_empty() {
-        return prompt;
-    }
-
-    prompt.push_str("\n\n## Available Skills\n\n");
-    prompt.push_str("The following skills are available. To use a skill, say ");
-    prompt.push_str("`[use: <skill-name>]` in your response.\n\n");
-
-    for meta in &metas {
-        prompt.push_str(&format!(
-            "- **{}**: {}\n",
-            meta.name,
-            if meta.description.is_empty() {
-                "(no description)"
-            } else {
-                &meta.description
+            for meta in &metas {
+                prompt.push_str(&format!(
+                    "- **{}**: {}\n",
+                    meta.name,
+                    if meta.description.is_empty() {
+                        "(no description)"
+                    } else {
+                        &meta.description
+                    }
+                ));
             }
-        ));
-    }
 
-    prompt.push_str("\nThe system will inject the full skill content automatically ");
-    prompt.push_str("when you reference it. Use skills when they match the user's intent.\n");
+            prompt.push_str("\nThe system will inject the full skill content automatically ");
+            prompt.push_str("when you reference it. Use skills when they match the user's intent.\n");
+        }
+    }
 
     prompt
+}
+
+/// Append core memory blocks to an existing system prompt.
+/// Called at runtime after MemoryManager is initialized.
+pub fn append_core_memory(prompt: &str, core_blocks: &[flint_memory::CoreBlock]) -> String {
+    if core_blocks.is_empty() {
+        return prompt.to_string();
+    }
+    let mut out = prompt.to_string();
+    out.push_str("\n\n## Memory (Core)\n");
+    out.push_str("The following is your core memory — always available context.\n");
+    out.push_str("You can update these blocks using the memory_update_core tool.\n\n");
+    for block in core_blocks {
+        out.push_str(&block.render());
+        out.push('\n');
+    }
+    out
 }
 
 /// Find a skill matching the user's input by name, [use:] marker, or description keywords.

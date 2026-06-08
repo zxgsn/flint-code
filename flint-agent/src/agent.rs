@@ -16,6 +16,10 @@ use std::time::Instant;
 
 use crate::session::Session;
 use crate::tool::{ToolContext, ToolRegistry};
+use std::time::Duration;
+
+/// Default timeout for individual tool execution (120 seconds).
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ── ANSI color helpers ────────────────────────────────────────────────────
 
@@ -102,6 +106,7 @@ pub async fn run_turn(
     ctx: &ToolContext,
     max_turns: u32,
     cancel: Option<Arc<AtomicBool>>,
+    max_output_chars: usize,
 ) -> Result<(String, TurnStats)> {
     let turn_start = Instant::now();
     let mut turn_iter = 0u32;
@@ -225,56 +230,82 @@ pub async fn run_turn(
             ))
         );
 
+        // Display tool call previews
         for tc in tool_calls.iter() {
-            // Check cancellation before each tool call
-            if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
-                eprintln!("{}", yellow("  ── interrupted, skipping remaining tools ──"));
-                break;
-            }
-
-            let tool_start = Instant::now();
-            print!(
-                "  {} {}",
-                yellow("*"),
-                bold(&tc.name)
-            );
-            // Show input preview for key tools
+            print!("  {} {}", yellow("*"), bold(&tc.name));
             if let Some(input_str) = tc.input.as_str() {
                 let preview: String = input_str.chars().take(80).collect();
                 if !preview.is_empty() {
                     print!(" {}", dim(&preview));
                 }
             } else if let Some(obj) = tc.input.as_object() {
-                // Show first key-value pair as preview
                 if let Some((k, v)) = obj.iter().next() {
                     let val_str = match v {
                         serde_json::Value::String(s) => {
                             let preview: String = s.chars().take(60).collect();
-                            if preview.len() < s.len() {
-                                format!("{}...", preview)
-                            } else {
-                                preview
-                            }
+                            if preview.len() < s.len() { format!("{}...", preview) } else { preview }
                         }
                         other => {
                             let s = other.to_string();
                             let preview: String = s.chars().take(60).collect();
-                            if preview.len() < s.len() {
-                                format!("{}...", preview)
-                            } else {
-                                preview
-                            }
+                            if preview.len() < s.len() { format!("{}...", preview) } else { preview }
                         }
                     };
                     print!(" {}", dim(&format!("{}: {}", k, val_str)));
                 }
             }
             println!();
-            std::io::stdout().flush()?;
+        }
+        std::io::stdout().flush()?;
 
-            let output = registry.execute(&tc.name, tc.input.clone(), ctx).await?;
-            let tool_elapsed = tool_start.elapsed();
+        // Execute tool calls — parallel when multiple, sequential when single
+        let tool_results: Vec<(usize, flint_types::ToolOutput, std::time::Duration)> = {
+            use futures::future::join_all;
+            let futs: Vec<_> = tool_calls.iter().enumerate().map(|(i, tc)| {
+                let tc_name = &tc.name;
+                let tc_input = &tc.input;
+                async move {
+                    let tool_start = Instant::now();
+                    let output = tokio::time::timeout(
+                        DEFAULT_TOOL_TIMEOUT,
+                        registry.execute(tc_name, tc_input.clone(), ctx),
+                    ).await;
+                    let elapsed = tool_start.elapsed();
+                    let output = match output {
+                        Ok(result) => result.unwrap_or_else(|e| {
+                            flint_types::ToolOutput::error(format!("tool error: {}", e))
+                        }),
+                        Err(_) => flint_types::ToolOutput::error(format!(
+                            "tool '{}' timed out after {} seconds",
+                            tc_name,
+                            DEFAULT_TOOL_TIMEOUT.as_secs()
+                        )),
+                    };
+                    (i, output, elapsed)
+                }
+            }).collect();
+            join_all(futs).await
+        };
+
+        // Display results and add to session in order
+        for (i, output, tool_elapsed) in tool_results {
             stats.tool_calls += 1;
+
+            // Truncate tool output if it exceeds max_output_chars
+            let output = if output.text.len() > max_output_chars {
+                let truncated_text = format!(
+                    "{}\n\n[truncated — output was {} chars, limit is {}]",
+                    &output.text[..max_output_chars],
+                    output.text.len(),
+                    max_output_chars
+                );
+                flint_types::ToolOutput {
+                    text: truncated_text,
+                    is_error: output.is_error,
+                }
+            } else {
+                output
+            };
 
             let sanitized = sanitize_preview(&output.text);
             let preview: String = sanitized.chars().take(200).collect();
@@ -295,7 +326,7 @@ pub async fn run_turn(
                     dim(&format!("({})", format_elapsed(tool_elapsed)))
                 );
             }
-            session.add_tool_result(&tc.id, &output);
+            session.add_tool_result(&tool_calls[i].id, &output);
         }
 
         // If cancelled during tool execution, break the outer loop

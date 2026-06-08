@@ -18,10 +18,11 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{AgentArgs, Cli, Commands, SetupArgs};
 use flint_agent::{Session, ToolContext, ToolRegistry};
+use flint_config::Feature;
 use flint_mcp::McpManager;
 use flint_provider::Provider;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ── Subcommand handlers ───────────────────────────────────────────────────
 
@@ -159,7 +160,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         .unwrap_or_else(|| config.provider.model.clone());
 
     // Build provider; on failure, launch setup wizard
-    let prov: Box<dyn Provider> = match provider::build_provider(&provider_type, &model) {
+    let raw_prov: Box<dyn Provider> = match provider::build_provider(&provider_type, &model) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}\n", e);
@@ -177,6 +178,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         }
     };
 
+    // Wrap with retry logic for transient API errors
+    let prov: Box<dyn Provider> = Box::new(flint_provider::RetryProvider::new(raw_prov));
+
     config.provider.r#type = provider_type;
     config.provider.model = model;
 
@@ -186,10 +190,38 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         .or_else(|| config.agent.system_prompt.clone())
         .unwrap_or_else(|| prompt::DEFAULT_SYSTEM.to_string());
 
-    let system = prompt::build_system_prompt(&base_system, &config, working_dir);
+    let mut system = prompt::build_system_prompt(&base_system, &config, working_dir);
 
     let mut registry = ToolRegistry::new();
     tools::register_builtins(&mut registry);
+
+    // Initialize memory system (if enabled)
+    let memory: Option<Arc<Mutex<flint_memory::MemoryManager>>> =
+        if config.features.is_enabled(Feature::Memory) {
+            let mem_config = flint_memory::MemoryConfig {
+                max_core_blocks: config.features.memory.max_core_blocks,
+                max_block_chars: config.features.memory.max_block_chars,
+                auto_extract: config.features.memory.auto_extract,
+                search_limit: config.features.memory.search_limit,
+                ..Default::default()
+            };
+            match flint_memory::MemoryManager::new(mem_config, Some(working_dir)) {
+                Ok(mm) => {
+                    // Inject core memory into system prompt
+                    system = prompt::append_core_memory(&system, mm.core_blocks());
+                    let shared = Arc::new(Mutex::new(mm));
+                    tools::register_memory_tools(&mut registry, shared.clone());
+                    eprintln!("Memory: enabled (core + archival)");
+                    Some(shared)
+                }
+                Err(e) => {
+                    eprintln!("Memory: failed to initialize: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Connect MCP servers
     let mut mcp_manager = McpManager::new();
@@ -234,6 +266,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             &ctx,
             config.agent.max_turns,
             Some(cancel),
+            config.agent.max_output_chars,
         )
         .await
         {
@@ -253,6 +286,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             cancel,
             mcp_manager,
             working_dir,
+            memory,
         )
         .await?;
     }

@@ -18,6 +18,10 @@ enabled = true
 
 [features.memory]
 enabled = true
+# max_core_blocks = 8       # max always-in-context memory blocks
+# max_block_chars = 2000    # char limit per core block
+# auto_extract = true       # auto-extract facts after each turn
+# search_limit = 5          # max memories to inject per turn
 
 [features.compaction]
 enabled = true

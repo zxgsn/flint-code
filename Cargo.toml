@@ -4,6 +4,7 @@ members = [
     "flint-config",
     "flint-provider",
     "flint-agent",
+    "flint-memory",
     "flint-mcp",
     "flint-cli",
 ]
@@ -19,6 +20,7 @@ flint-types   = { path = "flint-types" }
 flint-config  = { path = "flint-config" }
 flint-provider = { path = "flint-provider" }
 flint-agent   = { path = "flint-agent" }
+flint-memory  = { path = "flint-memory" }
 flint-mcp     = { path = "flint-mcp" }
 
 tokio       = { version = "1", features = ["full"] }

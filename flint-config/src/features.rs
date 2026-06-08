@@ -29,6 +29,18 @@ pub struct SkillConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     pub enabled: bool,
+    /// Maximum number of core memory blocks.
+    #[serde(default = "default_max_core_blocks")]
+    pub max_core_blocks: usize,
+    /// Character limit per core memory block.
+    #[serde(default = "default_max_block_chars")]
+    pub max_block_chars: usize,
+    /// Whether to auto-extract facts after each turn.
+    #[serde(default = "default_true")]
+    pub auto_extract: bool,
+    /// Maximum number of memories to inject into context per turn.
+    #[serde(default = "default_search_limit")]
+    pub search_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +75,24 @@ impl Features {
     }
 }
 
+// ── Default value helpers ─────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_core_blocks() -> usize {
+    8
+}
+
+fn default_max_block_chars() -> usize {
+    2000
+}
+
+fn default_search_limit() -> usize {
+    5
+}
+
 // ── Defaults: everything ON ─────────────────────────────────────────────────
 
 impl Default for SkillConfig {
@@ -77,7 +107,13 @@ impl Default for SkillConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            max_core_blocks: default_max_core_blocks(),
+            max_block_chars: default_max_block_chars(),
+            auto_extract: true,
+            search_limit: default_search_limit(),
+        }
     }
 }
 
