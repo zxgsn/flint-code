@@ -140,10 +140,24 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
                 let (output_tx, output_rx) = flint_swarm::output::channel();
                 tokio::spawn(flint_swarm::output::display_loop(output_rx));
                 // Clone registry before registering swarm tool
+                // Build a separate provider for sub-agents if swarm model is configured
+                let sub_agent_prov: Arc<dyn Provider> =
+                    if let Some(ref swarm_model) = sc.config.features.swarm.model {
+                        match provider::build_provider(&sc.config.provider.r#type, swarm_model) {
+                            Ok(p) => Arc::from(p),
+                            Err(e) => {
+                                eprintln!("Warning: failed to build swarm model ({}), using main model", e);
+                                sc.prov.clone()
+                            }
+                        }
+                    } else {
+                        sc.prov.clone()
+                    };
+
                 let sub_agent_registry = sc.registry.clone();
                 let manager = flint_swarm::SwarmManager::new(
                     swarm_config,
-                    sc.prov.clone(),
+                    sub_agent_prov,
                     sc.working_dir.to_path_buf(),
                     sc.system.to_string(),
                     output_tx,
@@ -151,7 +165,28 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
                     None, // No router when initializing from slash command
                 );
                 let shared = Arc::new(Mutex::new(manager));
-                flint_swarm::register_swarm_tools(sc.registry, shared.clone(), None);
+
+                // Build agent models list and provider factory for SwarmTool
+                let agent_models: Vec<String> = sc.config.features.swarm.agents.iter()
+                    .map(|p| p.model.clone())
+                    .collect();
+                let swarm_prov_type = sc.config.provider.r#type.clone();
+                let build_provider: flint_swarm::ProviderFactory = Box::new(move |model: &str| {
+                    provider::build_provider(&swarm_prov_type, model)
+                        .ok()
+                        .map(|p| Arc::from(p) as Arc<dyn Provider>)
+                });
+
+                flint_swarm::register_swarm_tools(
+                    sc.registry,
+                    shared.clone(),
+                    None,
+                    sc.config.features.swarm.spawn_mode.clone(),
+                    sc.config.features.swarm.model.clone(),
+                    agent_models,
+                    build_provider,
+                    sc.config.features.swarm.model_selection.clone(),
+                );
                 *sc.swarm = Some(shared);
                 eprintln!("Swarm: enabled (max {} agents)", sc.config.features.swarm.max_agents);
             }
@@ -408,51 +443,71 @@ fn dispatch_setup(sc: &mut SlashContext<'_>) -> Result<()> {
 /// /model — switch model
 fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()> {
     match name {
-        Some(m) => match provider::build_provider(&sc.config.provider.r#type, &m) {
-            Ok(p) => {
-                *sc.prov = Arc::from(p);
-                sc.config.provider.model = m.clone();
-                println!("Switched to model: {}\n", m);
-            }
-            Err(e) => println!("Failed to switch model: {}\n", e),
-        },
-        None => match crate::model_ui::run(&sc.config.provider.r#type, &sc.config.provider.model) {
-            Ok(Some((m, is_custom))) => {
-                if is_custom {
-                    let env_path = sc.working_dir.join(".env");
-                    println!("Custom model: {} -- opening provider setup...\n", m);
-                    match crate::setup_ui::run(&env_path) {
-                        Ok(true) => {
-                            provider::load_env_override(&env_path);
-                            let p_type = std::env::var("FLINT_PROVIDER")
-                                .unwrap_or_else(|_| sc.config.provider.r#type.clone());
-                            match provider::build_provider(&p_type, &m) {
-                                Ok(p) => {
-                                    *sc.prov = Arc::from(p);
-                                    sc.config.provider.r#type = p_type;
-                                    sc.config.provider.model = m.clone();
-                                    println!("Switched to model: {}\n", m);
-                                }
-                                Err(e) => println!("Failed to switch model: {}\n", e),
-                            }
-                        }
-                        Ok(false) => println!("Setup cancelled. Model not changed.\n"),
-                        Err(e) => println!("Setup error: {}\n", e),
+        Some(m) => {
+            match provider::build_provider(&sc.config.provider.r#type, &m) {
+                Ok(p) => {
+                    *sc.prov = Arc::from(p);
+                    sc.config.provider.model = m.clone();
+                    // Track in recent if not a preset
+                    if !crate::model_ui::is_preset(&sc.config.provider.r#type, &m)
+                        && !sc.config.provider.recent_models.contains(&m)
+                    {
+                        sc.config.provider.recent_models.push(m.clone());
                     }
-                } else {
-                    match provider::build_provider(&sc.config.provider.r#type, &m) {
-                        Ok(p) => {
-                            *sc.prov = Arc::from(p);
-                            sc.config.provider.model = m.clone();
-                            println!("Switched to model: {}\n", m);
+                    let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
+                    println!("Switched to model: {}\n", m);
+                }
+                Err(e) => println!("Failed to switch model: {}\n", e),
+            }
+        }
+        None => {
+            let recent = sc.config.provider.recent_models.clone();
+            match crate::model_ui::run(
+                &sc.config.provider.r#type,
+                &sc.config.provider.model,
+                &recent,
+            ) {
+                Ok(Some((m, is_custom, updated_recent))) => {
+                    // Persist the updated recent list
+                    sc.config.provider.recent_models = updated_recent;
+                    if is_custom {
+                        let env_path = sc.working_dir.join(".env");
+                        println!("Custom model: {} -- opening provider setup...\n", m);
+                        match crate::setup_ui::run(&env_path) {
+                            Ok(true) => {
+                                provider::load_env_override(&env_path);
+                                let p_type = std::env::var("FLINT_PROVIDER")
+                                    .unwrap_or_else(|_| sc.config.provider.r#type.clone());
+                                match provider::build_provider(&p_type, &m) {
+                                    Ok(p) => {
+                                        *sc.prov = Arc::from(p);
+                                        sc.config.provider.r#type = p_type;
+                                        sc.config.provider.model = m.clone();
+                                        let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
+                                        println!("Switched to model: {}\n", m);
+                                    }
+                                    Err(e) => println!("Failed to switch model: {}\n", e),
+                                }
+                            }
+                            Ok(false) => println!("Setup cancelled. Model not changed.\n"),
+                            Err(e) => println!("Setup error: {}\n", e),
                         }
-                        Err(e) => println!("Failed to switch model: {}\n", e),
+                    } else {
+                        match provider::build_provider(&sc.config.provider.r#type, &m) {
+                            Ok(p) => {
+                                *sc.prov = Arc::from(p);
+                                sc.config.provider.model = m.clone();
+                                let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
+                                println!("Switched to model: {}\n", m);
+                            }
+                            Err(e) => println!("Failed to switch model: {}\n", e),
+                        }
                     }
                 }
+                Ok(None) => println!("Cancelled.\n"),
+                Err(e) => println!("Error: {}\n", e),
             }
-            Ok(None) => println!("Cancelled.\n"),
-            Err(e) => println!("Error: {}\n", e),
-        },
+        }
     }
     Ok(())
 }
@@ -560,7 +615,7 @@ fn dispatch_swarm(sub: Option<String>, sc: &mut SlashContext<'_>) {
                 prompt.to_string()
             };
             let mut sm = swarm.lock().unwrap();
-            match sm.spawn_terminal(prompt, None, false) {
+            match sm.spawn_terminal(prompt, None, false, None) {
                 Ok(result) => {
                     println!(
                         "Spawned terminal agent [{}] (task {})\n\

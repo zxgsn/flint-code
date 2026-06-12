@@ -29,5 +29,5 @@ pub mod types;
 pub use agent::{InputRequest, InputResponse};
 pub use manager::SwarmManager;
 pub use router::{AgentResult, MessageRouter};
-pub use tool::register_swarm_tools;
+pub use tool::{ProviderFactory, register_swarm_tools};
 pub use types::{AgentNotification, AgentStatus, SpawnContext, SwarmConfig, TaskItem, TaskStatus};

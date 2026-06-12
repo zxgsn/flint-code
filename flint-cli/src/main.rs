@@ -300,10 +300,24 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                 }
             };
 
+            // Build a separate provider for sub-agents if swarm model is configured
+            let sub_agent_prov: Arc<dyn Provider> =
+                if let Some(ref swarm_model) = config.features.swarm.model {
+                    match provider::build_provider(&config.provider.r#type, swarm_model) {
+                        Ok(p) => Arc::from(p),
+                        Err(e) => {
+                            eprintln!("Warning: failed to build swarm model provider ({}), falling back to main model", e);
+                            prov_arc.clone()
+                        }
+                    }
+                } else {
+                    prov_arc.clone()
+                };
+
             let sub_agent_registry = registry.clone();
             let mut manager = flint_swarm::SwarmManager::new(
                 swarm_config,
-                prov_arc.clone(),
+                sub_agent_prov,
                 working_dir.to_path_buf(),
                 system.clone(),
                 output_tx,
@@ -312,19 +326,59 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             );
             let notify_rx = manager.take_notify_rx();
             let shared = Arc::new(Mutex::new(manager));
+            let model_selection = &config.features.swarm.model_selection;
+            let slot_info = if model_selection == "slots" && !config.features.swarm.agents.is_empty() {
+                let slot_list: Vec<String> = config.features.swarm.agents.iter().enumerate()
+                    .map(|(i, p)| {
+                        if p.model.is_empty() { format!("slot={}: (default)", i + 1) }
+                        else { format!("slot={}: {}", i + 1, p.model) }
+                    })
+                    .collect();
+                format!("\n\n**Model selection: slots** (auto-assigned round-robin)\n\
+                    Configured slots:\n{}\n\
+                    - The `model=` parameter is IGNORED in slots mode.\n\
+                    - To target a specific slot, use `slot=N` (e.g. `slot=1`).\n\
+                    - Without `slot=`, agents are assigned slots automatically in order.",
+                    slot_list.iter().map(|s| format!("  - {}", s)).collect::<Vec<_>>().join("\n"))
+            } else if model_selection == "fixed" {
+                let fixed_model = config.features.swarm.model.as_deref().unwrap_or("default");
+                format!("\n\n**Model selection: fixed** → all agents use `{}`", fixed_model)
+            } else {
+                "\n\n**Model selection: auto** — use `model=` to override per-agent.".to_string()
+            };
             system = format!(
                 "{}\n\n## Swarm Mode\n\
                 You have access to sub-agents via the `swarm` tool.\n\n\
                 **How to use:**\n\
-                - `swarm spawn prompt=\"task\"` — spawns a sub-agent in a new terminal window.\n\
+                - `swarm spawn prompt=\"task\"` — spawns a sub-agent.\n\
                 - For parallel work, call multiple `swarm spawn` in ONE message.\n\
                 - Sub-agent results are delivered AUTOMATICALLY when they complete.\n\
                 - Do NOT use swarm wait — results arrive as system messages.\n\
-                - After spawning, respond to the user immediately. Results will appear later.\n\n\
-                **Commands:** spawn, status, stop",
-                system
+                - After spawning, respond to the user immediately. Results will appear later.\n\
+                {}",
+                system, slot_info
             );
-            flint_swarm::register_swarm_tools(&mut registry, shared.clone(), router.clone());
+            // Build agent models list and provider factory for SwarmTool
+            let agent_models: Vec<String> = config.features.swarm.agents.iter()
+                .map(|p| p.model.clone())
+                .collect();
+            let swarm_provider_type = config.provider.r#type.clone();
+            let build_provider: flint_swarm::ProviderFactory = Box::new(move |model: &str| {
+                provider::build_provider(&swarm_provider_type, model)
+                    .ok()
+                    .map(|p| Arc::from(p) as Arc<dyn Provider>)
+            });
+
+            flint_swarm::register_swarm_tools(
+                &mut registry,
+                shared.clone(),
+                router.clone(),
+                config.features.swarm.spawn_mode.clone(),
+                config.features.swarm.model.clone(),
+                agent_models,
+                build_provider,
+                config.features.swarm.model_selection.clone(),
+            );
             eprintln!("Swarm: enabled (max {} agents)", config.features.swarm.max_agents);
             (Some(shared), notify_rx)
         } else {
@@ -397,6 +451,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let working_dir = dunce::canonicalize(&cli.dir)?;
+    let mut spawn_model: Option<String> = None;
 
     // --system-file: read system prompt from file
     if let Some(ref path) = cli.system_file {
@@ -420,6 +475,8 @@ async fn main() -> Result<()> {
         cli.agent_id = Some(ctx.agent_id.clone());
         cli.system = Some(ctx.system_prompt.clone());
         cli.initial_message = Some(ctx.initial_prompt.clone());
+        // Store spawn context model for later use in AgentArgs
+        spawn_model = ctx.model.clone();
         std::env::set_var("FLINT_SUB_AGENT_ID", &ctx.agent_id);
         std::env::set_var("FLINT_SUB_TASK_ID", &ctx.task_id);
         std::env::set_var("FLINT_SUB_ROUTER_ADDR", &ctx.router_addr);
@@ -444,13 +501,18 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Config) => cmd_config(&working_dir),
         Some(Commands::Setup(args)) => cmd_setup(args, &working_dir),
-        Some(Commands::Agent(args)) => cmd_agent(args, &working_dir).await,
+        Some(Commands::Agent(mut args)) => {
+            if args.model.is_none() {
+                args.model = spawn_model;
+            }
+            cmd_agent(args, &working_dir).await
+        }
         None => {
             cmd_agent(
                 AgentArgs {
                     prompt: cli.prompt,
                     provider: None,
-                    model: None,
+                    model: spawn_model,
                     system: cli.system,
                     initial_message: cli.initial_message,
                     message_file: cli.message_file,

@@ -1,3 +1,7 @@
 /target
 .env
 .flint.toml
+
+# Test / analysis files (not part of the project)
+analysis_*.md
+test-*.js

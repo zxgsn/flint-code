@@ -111,4 +111,7 @@ pub struct SpawnContext {
     pub working_dir: std::path::PathBuf,
     /// Initial task prompt from the coordinator.
     pub initial_prompt: String,
+    /// Model override for the sub-agent. None = use default.
+    #[serde(default)]
+    pub model: Option<String>,
 }

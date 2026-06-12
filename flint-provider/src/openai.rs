@@ -243,11 +243,13 @@ impl Provider for OpenAIProvider {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                .map_err(|_| anyhow::anyhow!("invalid API key"))?,
-        );
+        if !self.api_key.is_empty() {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+                    .map_err(|_| anyhow::anyhow!("invalid API key"))?,
+            );
+        }
 
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self.client.post(&url).headers(headers).json(&body).send().await?;

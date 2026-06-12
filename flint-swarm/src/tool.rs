@@ -22,16 +22,31 @@ use anyhow::Result;
 use async_trait::async_trait;
 use flint_agent::{Tool, ToolContext, ToolRegistry};
 use flint_types::{ToolDefinition, ToolOutput};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
 use crate::manager::SwarmManager;
 use crate::router::MessageRouter;
 
 type SharedSwarm = Arc<Mutex<SwarmManager>>;
 
+/// Closure that builds a provider for a given model name.
+/// Returns None on failure (caller should fall back to default).
+pub type ProviderFactory = Box<dyn Fn(&str) -> Option<Arc<dyn flint_provider::Provider>> + Send + Sync>;
+
 pub struct SwarmTool {
     pub swarm: SharedSwarm,
     pub router: Option<Arc<MessageRouter>>,
+    pub default_spawn_mode: String,
+    /// Default model for sub-agents (from config). None = inherit parent.
+    pub default_model: Option<String>,
+    /// Per-slot model assignments. Index 0 = agent 1, etc.
+    pub agent_models: Vec<String>,
+    /// Factory to build providers for model overrides.
+    pub build_provider: ProviderFactory,
+    /// Model selection strategy: "auto", "slots", or "fixed".
+    pub model_selection: String,
+    /// Auto-incrementing slot counter for "slots" mode.
+    pub next_slot: AtomicUsize,
 }
 
 #[async_trait]
@@ -56,8 +71,10 @@ impl Tool for SwarmTool {
                     "prompt": { "type": "string", "description": "Task description (for spawn/assign)" },
                     "agent_id": { "type": "string", "description": "Agent ID (for assign/wait/stop)" },
                     "timeout": { "type": "integer", "description": "Timeout in seconds for wait command (default 600)" },
-                    "mode": { "type": "string", "description": "terminal (new terminal with full REPL, default), interactive (streaming display in main terminal), or in-process (background task)", "enum": ["terminal", "interactive", "in-process"], "default": "terminal" },
-                    "full_context": { "type": "boolean", "description": "For terminal mode: inherit full conversation history (default false, inherits only system prompt + task)", "default": false }
+                    "mode": { "type": "string", "description": "terminal (new terminal with full REPL), interactive (streaming display in main terminal), or in-process (background task). Default comes from config.", "enum": ["terminal", "interactive", "in-process"] },
+                    "full_context": { "type": "boolean", "description": "For terminal mode: inherit full conversation history (default false, inherits only system prompt + task)", "default": false },
+                    "model": { "type": "string", "description": "Override model (only in 'auto' mode). In 'slots' mode this is ignored — models are assigned automatically." },
+                    "slot": { "type": "integer", "description": "Agent slot number (1-indexed). In 'slots' mode, models are auto-assigned if omitted. In 'auto' mode, optionally picks a pre-configured slot model." }
                 },
                 "required": ["command"]
             }),
@@ -79,27 +96,81 @@ impl Tool for SwarmTool {
             "spawn" => {
                 let prompt = input["prompt"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("missing 'prompt'"))?;
-                let mode = input["mode"].as_str().unwrap_or("terminal");
+                let mode = input["mode"].as_str().unwrap_or(&self.default_spawn_mode);
+
+                // Resolve model based on selection strategy
+                let resolved_model = match self.model_selection.as_str() {
+                    "fixed" => {
+                        if input["model"].as_str().is_some() || input["slot"].as_i64().is_some() {
+                            return Ok(ToolOutput::error(
+                                "model_selection is 'fixed' — cannot override model per-agent. \
+                                 Change [features.swarm] model_selection to 'auto' or 'slots' to allow overrides."
+                            ));
+                        }
+                        self.default_model.clone()
+                    }
+                    "slots" => {
+                        if self.agent_models.is_empty() {
+                            self.default_model.clone()
+                        } else if let Some(slot) = input["slot"].as_i64() {
+                            // Explicit slot specified (model= is silently ignored in slots mode)
+                            let idx = (slot - 1) as usize; // 1-indexed to 0-indexed
+                            if idx >= self.agent_models.len() {
+                                return Ok(ToolOutput::error(format!(
+                                    "slot {} out of range (have {} slots configured)",
+                                    slot, self.agent_models.len()
+                                )));
+                            }
+                            let m = self.agent_models[idx].clone();
+                            if m.is_empty() { None } else { Some(m) }
+                        } else {
+                            // Auto-assign next slot in round-robin
+                            let slot_num = self.next_slot.fetch_add(1, Ordering::Relaxed);
+                            let idx = slot_num % self.agent_models.len();
+                            let m = self.agent_models[idx].clone();
+                            if m.is_empty() { None } else { Some(m) }
+                        }
+                    }
+                    _ => {
+                        // "auto" — agent decides freely
+                        if let Some(m) = input["model"].as_str() {
+                            Some(m.to_string())
+                        } else if let Some(slot) = input["slot"].as_i64() {
+                            let idx = (slot - 1) as usize;
+                            self.agent_models.get(idx)
+                                .map(|m| m.clone())
+                                .filter(|m| !m.is_empty())
+                        } else {
+                            self.default_model.clone()
+                        }
+                    }
+                };
+
+                // Build provider override if a specific model was resolved
+                let provider_override = resolved_model.as_ref().and_then(|m| {
+                    (self.build_provider)(m)
+                });
+                let model_label = resolved_model.clone().unwrap_or_else(|| "default".to_string());
 
                 if mode == "in-process" {
                     // In-process mode: runs as background tokio task
                     let spawn_result = {
                         let mut swarm = self.swarm.lock().unwrap();
-                        swarm.spawn_agent(prompt.to_string())
+                        swarm.spawn_agent(prompt.to_string(), provider_override)
                     };
                     match spawn_result {
                         Ok(result) => {
                             Ok(ToolOutput::text(format!(
-                                "Spawned agent {} (task {})\n\
+                                "Spawned agent {} (task {}) [model: {}]\n\
                                  The agent is running in the background.\n\
                                  Use 'swarm wait agent_id={}' to get its result.",
-                                result.agent_id, result.task_id, result.agent_id,
+                                result.agent_id, result.task_id, model_label, result.agent_id,
                             )))
                         }
                         Err(e) => Ok(ToolOutput::error(format!("spawn failed: {}", e))),
                     }
                 } else if mode == "terminal" {
-                    // Terminal mode: new terminal with full REPL (方案 A)
+                    // Terminal mode: new terminal with full REPL
                     let full_context = input["full_context"].as_bool().unwrap_or(false);
                     let spawn_result = {
                         let mut swarm = self.swarm.lock().unwrap();
@@ -107,17 +178,19 @@ impl Tool for SwarmTool {
                             prompt.to_string(),
                             None, // conversation history not available from tool input
                             full_context,
+                            resolved_model, // terminal sub-agent picks up model via SpawnContext
                         )
                     };
                     match spawn_result {
                         Ok(result) => {
                             Ok(ToolOutput::text(format!(
-                                "Spawned terminal agent [{}] in new window.\n\
+                                "Spawned terminal agent [{}] in new window [model: {}].\n\
                                  Task ID: {}\n\
                                  The agent is running as an independent REPL with its own terminal.\n\
                                  It communicates with you via the MessageRouter.\n\
                                  Use 'swarm wait agent_id={}' to retrieve the result.",
                                 &result.agent_id[result.agent_id.len()-4..],
+                                model_label,
                                 result.task_id, result.agent_id,
                             )))
                         }
@@ -127,7 +200,7 @@ impl Tool for SwarmTool {
                     // Interactive mode: streaming display in main terminal
                     let spawn_result = {
                         let mut swarm = self.swarm.lock().unwrap();
-                        swarm.spawn_interactive(prompt.to_string())
+                        swarm.spawn_interactive(prompt.to_string(), provider_override)
                     };
                     match spawn_result {
                         Ok(agent_id) => {
@@ -140,12 +213,12 @@ impl Tool for SwarmTool {
                             };
                             let result_dir = crate::log::log_dir();
                             Ok(ToolOutput::text(format!(
-                                "Spawned interactive agent [{}] in new terminal.\n\
+                                "Spawned interactive agent [{}] [model: {}].\n\
                                  Task ID: {}\n\
                                  The agent is running independently with its own REPL.\n\
                                  It will save results to: {}\\*_{}.result.md\n\
                                  Use 'swarm wait agent_id={}' to retrieve the result.",
-                                &agent_id[agent_id.len()-4..], task_id,
+                                &agent_id[agent_id.len()-4..], model_label, task_id,
                                 result_dir.display(), task_id, agent_id,
                             )))
                         }
@@ -511,8 +584,26 @@ impl Tool for RequestInputTool {
 
 // ── Registration ─────────────────────────────────────────────────────────
 
-pub fn register_swarm_tools(registry: &mut ToolRegistry, swarm: SharedSwarm, router: Option<Arc<MessageRouter>>) {
-    registry.register(SwarmTool { swarm, router });
+pub fn register_swarm_tools(
+    registry: &mut ToolRegistry,
+    swarm: SharedSwarm,
+    router: Option<Arc<MessageRouter>>,
+    default_spawn_mode: String,
+    default_model: Option<String>,
+    agent_models: Vec<String>,
+    build_provider: ProviderFactory,
+    model_selection: String,
+) {
+    registry.register(SwarmTool {
+        swarm,
+        router,
+        default_spawn_mode,
+        default_model,
+        agent_models,
+        build_provider,
+        model_selection,
+        next_slot: AtomicUsize::new(0),
+    });
 }
 
 /// Register base file/shell tools on a sub-agent's registry.

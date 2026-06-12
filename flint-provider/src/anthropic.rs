@@ -211,19 +211,21 @@ impl Provider for AnthropicProvider {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        if self.use_bearer_auth {
-            let bearer = format!("Bearer {}", self.api_key);
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&bearer)
-                    .map_err(|_| anyhow::anyhow!("invalid API key"))?,
-            );
-        } else {
-            headers.insert(
-                "x-api-key",
-                HeaderValue::from_str(&self.api_key)
-                    .map_err(|_| anyhow::anyhow!("invalid API key"))?,
-            );
+        if !self.api_key.is_empty() {
+            if self.use_bearer_auth {
+                let bearer = format!("Bearer {}", self.api_key);
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&bearer)
+                        .map_err(|_| anyhow::anyhow!("invalid API key"))?,
+                );
+            } else {
+                headers.insert(
+                    "x-api-key",
+                    HeaderValue::from_str(&self.api_key)
+                        .map_err(|_| anyhow::anyhow!("invalid API key"))?,
+                );
+            }
         }
 
         // If base_url already contains a path (e.g. proxy with /v1/chat/completions), use as-is

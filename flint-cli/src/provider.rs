@@ -109,13 +109,10 @@ fn find_base_url(provider: &str) -> Option<String> {
 }
 
 /// Build a provider from type and model, resolving API key from env vars.
+/// API key is optional — when not found, requests are sent without authentication
+/// (useful for self-hosted / local models that don't require a key).
 pub fn build_provider(provider_type: &str, model: &str) -> Result<Box<dyn Provider>> {
-    let (key, from_auth_token) = find_api_key(provider_type).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No API key found for '{}'. Run 'flint setup' to configure.",
-            provider_type
-        )
-    })?;
+    let (key, from_auth_token) = find_api_key(provider_type).unwrap_or_default();
 
     match provider_type {
         "anthropic" => {

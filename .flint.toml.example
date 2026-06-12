@@ -1,6 +1,7 @@
 [provider]
 type = "openai"
 model = "gpt-4o"
+# recent_models = ["mimo-v2.5-pro", "deepseek-v3"]  # auto-managed by /model
 
 [agent]
 max_turns = 50
@@ -28,6 +29,23 @@ enabled = true
 
 [features.permissions]
 enabled = true
+
+# [features.swarm]
+# enabled = false
+# model = "gpt-4o-mini"        # sub-agent model (default: inherit parent)
+# max_agents = 5               # max concurrent sub-agents
+# agent_max_turns = 20         # max LLM turns per sub-agent
+# spawn_mode = "terminal"      # "terminal" (new OS window) or "in-process" (background task)
+# model_selection = "auto"     # "auto" (agent picks freely), "slots" (per-slot assignment), "fixed" (always default)
+#
+# Per-slot model assignment — agent 1, 2, 3 get specific models.
+# Empty model or missing slot = inherit default.
+# Use: swarm spawn prompt="task" slot=1
+# [[features.swarm.agents]]
+# model = "qwen-coder-plus"    # agent 1
+#
+# [[features.swarm.agents]]
+# model = "deepseek-v3"        # agent 2
 
 # MCP servers — external tool servers via Model Context Protocol
 # [mcp_servers.memory]

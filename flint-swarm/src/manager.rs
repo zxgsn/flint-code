@@ -92,7 +92,7 @@ impl SwarmManager {
     /// Spawn a sub-agent. Returns a oneshot receiver for the first result.
     /// The agent stays alive for follow-up messages.
     /// The result is also delivered via the notification channel.
-    pub fn spawn_agent(&mut self, prompt: String) -> anyhow::Result<SpawnResult> {
+    pub fn spawn_agent(&mut self, prompt: String, provider_override: Option<Arc<dyn Provider>>) -> anyhow::Result<SpawnResult> {
         if self.agents.len() >= self.config.max_agents {
             return Err(anyhow::anyhow!(
                 "max agents ({}) reached. Stop an agent first.",
@@ -135,7 +135,7 @@ impl SwarmManager {
 
         // Spawn agent task (stays alive waiting for messages)
         // Clone the coordinator's full registry so the sub-agent has all tools.
-        let provider = self.provider.clone();
+        let provider = provider_override.unwrap_or_else(|| self.provider.clone());
         let system = self.system_prompt.clone();
         let ctx = ToolContext { working_dir: self.working_dir.clone() };
         let output_tx = self.output_tx.clone();
@@ -179,7 +179,7 @@ impl SwarmManager {
     /// The agent runs as a tokio task. Its output is streamed to the main
     /// terminal via a channel. The REPL displays the output and forwards
     /// user input to the agent when needed.
-    pub fn spawn_interactive(&mut self, prompt: String) -> anyhow::Result<String> {
+    pub fn spawn_interactive(&mut self, prompt: String, provider_override: Option<Arc<dyn Provider>>) -> anyhow::Result<String> {
         if self.agents.len() >= self.config.max_agents {
             return Err(anyhow::anyhow!("max agents ({}) reached", self.config.max_agents));
         }
@@ -212,7 +212,7 @@ impl SwarmManager {
         });
 
         // Spawn agent task with streaming output
-        let provider = self.provider.clone();
+        let provider = provider_override.unwrap_or_else(|| self.provider.clone());
         let system = self.system_prompt.clone();
         let ctx = ToolContext { working_dir: self.working_dir.clone() };
         let output_tx = self.output_tx.clone();
@@ -261,6 +261,7 @@ impl SwarmManager {
         prompt: String,
         conversation_history: Option<Vec<flint_types::Message>>,
         full_context: bool,
+        model: Option<String>,
     ) -> anyhow::Result<SpawnResult> {
         if self.agents.len() >= self.config.max_agents {
             return Err(anyhow::anyhow!(
@@ -299,6 +300,7 @@ impl SwarmManager {
             &self.working_dir,
             &router_addr,
             full_context,
+            model,
         )?;
 
         // Create a dummy join handle — the external process is not a tokio task.

@@ -21,6 +21,9 @@ pub struct ProviderConfig {
     /// Model identifier
     #[serde(default = "default_model")]
     pub model: String,
+    /// Previously used custom models (persisted across sessions).
+    #[serde(default)]
+    pub recent_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +252,12 @@ fn merge_provider(target: &mut crate::config::ProviderConfig, source: &crate::co
     // This ensures user's explicit config is respected
     target.r#type = source.r#type.clone();
     target.model = source.model.clone();
+    // Merge recent_models additively (dedup, preserve order)
+    for m in &source.recent_models {
+        if !target.recent_models.contains(m) {
+            target.recent_models.push(m.clone());
+        }
+    }
 }
 
 fn merge_agent(target: &mut AgentConfig, source: &AgentConfig) {
@@ -343,6 +352,7 @@ impl Default for ProviderConfig {
         Self {
             r#type: default_provider_type(),
             model: default_model(),
+            recent_models: Vec::new(),
         }
     }
 }

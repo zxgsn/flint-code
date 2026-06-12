@@ -54,6 +54,15 @@ pub struct PermissionConfig {
     pub enabled: bool,
 }
 
+/// Per-agent model slot — assigns a specific model to agent 1, 2, 3, etc.
+/// Position in the list determines the slot number (0-indexed).
+/// Empty model string means "use default".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProfile {
+    #[serde(default)]
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmConfig {
     pub enabled: bool,
@@ -66,6 +75,20 @@ pub struct SwarmConfig {
     /// Task timeout in seconds.
     #[serde(default = "default_task_timeout_secs")]
     pub task_timeout_secs: u64,
+    /// Model override for sub-agents. None = inherit parent model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Default spawn mode: "terminal" or "in-process".
+    #[serde(default = "default_spawn_mode")]
+    pub spawn_mode: String,
+    /// Named agent profiles — each defines a model for a specific role.
+    /// Referenced via `profile="name"` in swarm spawn.
+    #[serde(default)]
+    pub agents: Vec<AgentProfile>,
+    /// Model selection strategy: "auto" (agent decides freely),
+    /// "profiles_only" (must pick from profiles), or "fixed" (always use default).
+    #[serde(default = "default_model_selection")]
+    pub model_selection: String,
 }
 
 // ── Aggregate feature container ─────────────────────────────────────────────
@@ -123,6 +146,14 @@ fn default_task_timeout_secs() -> u64 {
     300
 }
 
+fn default_spawn_mode() -> String {
+    "terminal".to_string()
+}
+
+fn default_model_selection() -> String {
+    "auto".to_string()
+}
+
 // ── Defaults: everything ON ─────────────────────────────────────────────────
 
 impl Default for SkillConfig {
@@ -166,6 +197,10 @@ impl Default for SwarmConfig {
             max_agents: default_max_agents(),
             agent_max_turns: default_agent_max_turns(),
             task_timeout_secs: default_task_timeout_secs(),
+            model: None,
+            spawn_mode: default_spawn_mode(),
+            agents: Vec::new(),
+            model_selection: default_model_selection(),
         }
     }
 }

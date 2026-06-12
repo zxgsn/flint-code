@@ -726,6 +726,7 @@ pub fn spawn_terminal_agent(
     working_dir: &std::path::Path,
     router_addr: &str,
     full_context: bool,
+    model: Option<String>,
 ) -> anyhow::Result<std::path::PathBuf> {
     use crate::types::SpawnContext;
 
@@ -738,6 +739,7 @@ pub fn spawn_terminal_agent(
         router_addr: router_addr.to_string(),
         working_dir: working_dir.to_path_buf(),
         initial_prompt: prompt.to_string(),
+        model,
     };
 
     // Serialize to JSON file in the log directory
