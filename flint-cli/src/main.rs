@@ -214,11 +214,13 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     // Auto-poke hint in system prompt (only for main agents, not sub-agents)
     if args.spawn_context.is_none() {
         system.push_str("\n\n## Todo Tool\n\
-            You have a `todo` tool for tracking multi-step tasks. \
-            When given a complex request, break it into todos and track progress. \
+            For multi-step requests, you MUST use the `todo` tool first:\n\
+            1. `todo add` each sub-task before starting work\n\
+            2. Execute them one by one\n\
+            3. `todo update` each to `completed` when done\n\n\
+            Simple single-step tasks (one read, one write, one question) do not need todos.\n\
             After each turn with incomplete todos, you will receive an automatic \
-            \"continue working\" prompt. Use `todo update` to mark items as completed \
-            or cancelled as you finish them.");
+            \"continue working\" prompt — keep going until all are done.");
     }
 
     // Initialize memory system (if enabled)
