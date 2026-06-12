@@ -21,6 +21,9 @@ pub struct FileSnapshot {
 pub struct TurnCheckpoint {
     pub turn_number: u32,
     pub snapshots: Vec<FileSnapshot>,
+    /// Number of messages in the session before this turn started.
+    /// Used to truncate session messages on rollback.
+    pub session_msg_count: usize,
 }
 
 /// Thread-safe checkpoint store shared between tools and the REPL.
@@ -49,8 +52,25 @@ pub fn record_snapshot(store: &CheckpointStore, turn: u32, path: PathBuf, origin
             checkpoints.push(TurnCheckpoint {
                 turn_number: turn,
                 snapshots: vec![snapshot],
+                session_msg_count: 0, // will be set by set_session_msg_count
             });
         }
+    }
+}
+
+/// Set the session message count for a turn's checkpoint.
+/// Called before the turn starts, so we know where to truncate on rollback.
+pub fn set_session_msg_count(store: &CheckpointStore, turn: u32, count: usize) {
+    let mut checkpoints = store.lock().unwrap();
+    if let Some(cp) = checkpoints.iter_mut().find(|c| c.turn_number == turn) {
+        cp.session_msg_count = count;
+    } else {
+        // Create a checkpoint entry even if no files were modified
+        checkpoints.push(TurnCheckpoint {
+            turn_number: turn,
+            snapshots: Vec::new(),
+            session_msg_count: count,
+        });
     }
 }
 

@@ -139,6 +139,10 @@ pub async fn run(
         session.add_user(msg);
         cancel.store(false, Ordering::Relaxed);
 
+        flint_agent::checkpoint::set_session_msg_count(
+            &checkpoint_store, turn_count, session.messages.len(),
+        );
+
         let effective_system = system.to_string();
         let render_line = |line: &str| {
             crate::repl::render::render_markdown_line_to_stdout(line);
@@ -226,6 +230,9 @@ pub async fn run(
             ));
             turn_count += 1;
             turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
+            flint_agent::checkpoint::set_session_msg_count(
+                &checkpoint_store, turn_count, session.messages.len(),
+            );
             let effective_system = system.to_string();
             let render_line = |line: &str| {
                 crate::repl::render::render_markdown_line_to_stdout(line);
@@ -364,6 +371,9 @@ pub async fn run(
                 session.messages.push(flint_types::Message::system(&result_msg));
                 turn_count += 1;
                 turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
+                flint_agent::checkpoint::set_session_msg_count(
+                    &checkpoint_store, turn_count, session.messages.len(),
+                );
                 let effective_system = system.to_string();
                 let render_line = |line: &str| {
                     crate::repl::render::render_markdown_line_to_stdout(line);
@@ -431,9 +441,27 @@ pub async fn run(
             continue;
         }
 
+        // Natural language undo detection
+        if is_undo_request(&input) {
+            perform_undo(
+                &checkpoint_store,
+                &mut session,
+                working_dir,
+            );
+            continue;
+        }
+
         // Normal message -> send to LLM
         turn_count += 1;
         turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
+
+        // Record session message count before this turn (for rollback)
+        flint_agent::checkpoint::set_session_msg_count(
+            &checkpoint_store,
+            turn_count,
+            session.messages.len(),
+        );
+
         eprintln!("\x1b[34m{}>\x1b[0m {}", turn_count, input);
 
         // Reset auto-poke counter on user input
@@ -549,6 +577,10 @@ pub async fn run(
                     );
 
                     session.add_user(&poke_msg);
+
+                    flint_agent::checkpoint::set_session_msg_count(
+                        &checkpoint_store, turn_count, session.messages.len(),
+                    );
 
                     match run_turn(
                         prov.as_ref(),
@@ -1043,6 +1075,83 @@ pub async fn run_display_mode(router_addr: &str, agent_id: &str) -> Result<()> {
 
     eprintln!("\n\x1b[90m  Display client disconnected.\x1b[0m");
     Ok(())
+}
+
+// ── Undo detection and execution ─────────────────────────────────────────
+
+/// Check if user input is a natural language undo request.
+fn is_undo_request(input: &str) -> bool {
+    let trimmed = input.trim();
+    // Slash command
+    if trimmed == "/undo" {
+        return true;
+    }
+    // Natural language patterns (Chinese + English)
+    let patterns = [
+        "回退", "撤销", "回滚", "退回上一轮", "退回上一步",
+        "撤销上一轮", "撤销上一步", "回退上一轮", "回退上一步",
+        "undo", "revert", "rollback",
+        "撤销修改", "回退修改", "撤销代码", "回退代码",
+        "撤销刚才", "回退刚才", "撤销这次", "回退这次",
+    ];
+    let lower = trimmed.to_lowercase();
+    patterns.iter().any(|p| lower.contains(p))
+}
+
+/// Perform undo: restore files and truncate session messages.
+fn perform_undo(
+    checkpoint_store: &flint_agent::CheckpointStore,
+    session: &mut flint_agent::Session,
+    working_dir: &std::path::Path,
+) {
+    let count = flint_agent::checkpoint::checkpoint_count(checkpoint_store);
+    if count == 0 {
+        println!("Nothing to undo.\n");
+        return;
+    }
+
+    let cp = flint_agent::checkpoint::pop_latest(checkpoint_store).unwrap();
+    let turn = cp.turn_number;
+    let file_count = cp.snapshots.len();
+    let mut restored = 0;
+    let mut deleted = 0;
+
+    for snap in &cp.snapshots {
+        let full = working_dir.join(&snap.path);
+        match &snap.original_content {
+            Some(content) => {
+                if let Err(e) = std::fs::write(&full, content) {
+                    eprintln!("  x failed to restore {}: {}", snap.path.display(), e);
+                } else {
+                    println!("  + restored {}", snap.path.display());
+                    restored += 1;
+                }
+            }
+            None => {
+                if full.exists() {
+                    if let Err(e) = std::fs::remove_file(&full) {
+                        eprintln!("  x failed to delete {}: {}", snap.path.display(), e);
+                    } else {
+                        println!("  - deleted {}", snap.path.display());
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Truncate session messages back to before this turn
+    let msg_before = session.messages.len();
+    if cp.session_msg_count < msg_before {
+        session.messages.truncate(cp.session_msg_count);
+        let removed = msg_before - cp.session_msg_count;
+        println!("  ~ truncated {} message(s) from conversation", removed);
+    }
+
+    println!(
+        "\nUndo turn {}: {} file(s) restored, {} deleted, {} checkpoint(s) remaining.\n",
+        turn, restored, deleted, count - 1
+    );
 }
 
 // ── Notification drain helpers ───────────────────────────────────────────
