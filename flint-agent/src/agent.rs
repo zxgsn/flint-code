@@ -97,6 +97,13 @@ pub struct TurnStats {
 /// Run a single agent turn: send messages to the provider, stream the response,
 /// execute any tool calls, and loop until the LLM produces a final text response.
 ///
+/// When `silent` is true, suppresses all terminal output (used by background tasks
+/// like compaction/extraction). Sub-agents should use `silent=true` with a `callback`
+/// for real-time event forwarding.
+///
+/// `callback` receives structured events for real-time observation. If the callback
+/// returns `true`, the default terminal output is also shown; if `false`, it's suppressed.
+///
 /// Returns the assistant's final text response and turn statistics.
 pub async fn run_turn(
     provider: &dyn Provider,
@@ -107,6 +114,8 @@ pub async fn run_turn(
     max_turns: u32,
     cancel: Option<Arc<AtomicBool>>,
     max_output_chars: usize,
+    silent: bool,
+    callback: Option<&crate::EventCallback>,
 ) -> Result<(String, TurnStats)> {
     let turn_start = Instant::now();
     let mut turn_iter = 0u32;
@@ -117,25 +126,37 @@ pub async fn run_turn(
 
         // Check max_turns limit
         if turn_iter > max_turns {
-            eprintln!(
-                "{}",
-                yellow(&format!(
-                    "  ── max turns ({}) reached, stopping ──",
-                    max_turns
-                ))
-            );
+            if !silent {
+                eprintln!(
+                    "{}",
+                    yellow(&format!(
+                        "  ── max turns ({}) reached, stopping ──",
+                        max_turns
+                    ))
+                );
+            }
             break;
         }
 
         // Check cancellation
         if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
-            eprintln!("{}", yellow("  ── interrupted by user ──"));
+            if !silent {
+                eprintln!("{}", yellow("  ── interrupted by user ──"));
+            }
             break;
         }
 
-        // Show thinking indicator
-        print!("\r\x1b[K{} {}", cyan("~"), dim("Thinking..."));
-        std::io::stdout().flush()?;
+        // Emit thinking event
+        let mut print_this = !silent;
+        if let Some(cb) = &callback {
+            if !cb(&crate::AgentEvent::Thinking) {
+                print_this = false;
+            }
+        }
+        if print_this {
+            print!("\r\x1b[K{} {}", cyan("~"), dim("Thinking..."));
+            std::io::stdout().flush()?;
+        }
 
         let api_start = Instant::now();
         let mut stream = provider
@@ -152,28 +173,39 @@ pub async fn run_turn(
                 StreamEvent::TextDelta(t) => {
                     if first_delta {
                         let elapsed = api_start.elapsed();
-                        print!("\r\x1b[K");
-                        eprint!("\r\x1b[K");
-                        // Show a subtle header before assistant response
-                        eprintln!(
-                            "{}",
-                            dim(&format!("  assistant ({})", format_elapsed(elapsed)))
-                        );
+                        let mut print_delta = !silent;
+                        if let Some(cb) = &callback {
+                            if !cb(&crate::AgentEvent::Thinking) { print_delta = false; }
+                        }
+                        if print_delta {
+                            print!("\r\x1b[K");
+                            eprint!("\r\x1b[K");
+                            eprintln!("{}", dim(&format!("  assistant ({})", format_elapsed(elapsed))));
+                        }
                         first_delta = false;
                     }
                     token_count += t.len();
                     text.push_str(&t);
-                    print!("{}", t);
+                    let mut print_text = !silent;
+                    if let Some(cb) = &callback {
+                        if !cb(&crate::AgentEvent::TextDelta(t.clone())) { print_text = false; }
+                    }
+                    if print_text {
+                        print!("{}", t);
+                    }
                 }
                 StreamEvent::ToolCall(tc) => {
                     if first_delta {
                         let elapsed = api_start.elapsed();
-                        print!("\r\x1b[K");
-                        eprint!("\r\x1b[K");
-                        eprintln!(
-                            "{}",
-                            dim(&format!("  assistant ({})", format_elapsed(elapsed)))
-                        );
+                        let mut print_tc = !silent;
+                        if let Some(cb) = &callback {
+                            if !cb(&crate::AgentEvent::Thinking) { print_tc = false; }
+                        }
+                        if print_tc {
+                            print!("\r\x1b[K");
+                            eprint!("\r\x1b[K");
+                            eprintln!("{}", dim(&format!("  assistant ({})", format_elapsed(elapsed))));
+                        }
                         first_delta = false;
                     }
                     tool_calls.push(tc);
@@ -189,85 +221,100 @@ pub async fn run_turn(
             stats.llm_calls = turn_iter;
             stats.total_chars = token_count;
             let total_elapsed = turn_start.elapsed();
-            println!();
-            // Turn footer with stats
-            if text.is_empty() {
-                eprintln!(
-                    "{}",
-                    yellow(&format!(
-                        "  ── turn complete · {} · no response (empty) ──",
-                        format_elapsed(total_elapsed)
-                    ))
-                );
-            } else {
-                eprintln!(
-                    "{}",
-                    dim(&format!(
-                        "  ── turn complete · {} · {} chars · {} tool calls ──",
-                        format_elapsed(total_elapsed),
-                        token_count,
-                        stats.tool_calls
-                    ))
-                );
+            if let Some(cb) = &callback {
+                cb(&crate::AgentEvent::TurnComplete {
+                    text: text.clone(),
+                    llm_calls: stats.llm_calls,
+                    tool_calls: stats.tool_calls,
+                    chars: token_count,
+                    elapsed_ms: total_elapsed.as_millis() as u64,
+                });
             }
-            println!();
+            if !silent {
+                println!();
+                if text.is_empty() {
+                    eprintln!(
+                        "{}",
+                        yellow(&format!(
+                            "  ── turn complete · {} · no response (empty) ──",
+                            format_elapsed(total_elapsed)
+                        ))
+                    );
+                } else {
+                    eprintln!(
+                        "{}",
+                        dim(&format!(
+                            "  ── turn complete · {} · {} chars · {} tool calls ──",
+                            format_elapsed(total_elapsed),
+                            token_count,
+                            stats.tool_calls
+                        ))
+                    );
+                }
+                println!();
+            }
             return Ok((text, stats));
         }
 
         // Has tool calls → execute them and loop
         session.add_assistant_with_tools(&text, &tool_calls);
 
-        // Show tool calls header
-        let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-        if !text.is_empty() {
-            println!();
-        }
-        eprintln!(
-            "{}",
-            dim(&format!(
-                "  tools: {}",
-                tool_names.join(" · ")
-            ))
-        );
-
-        // Display tool call previews
-        for tc in tool_calls.iter() {
-            print!("  {} {}", yellow("*"), bold(&tc.name));
-            if let Some(input_str) = tc.input.as_str() {
-                let preview: String = input_str.chars().take(80).collect();
-                if !preview.is_empty() {
-                    print!(" {}", dim(&preview));
-                }
-            } else if let Some(obj) = tc.input.as_object() {
-                if let Some((k, v)) = obj.iter().next() {
-                    let val_str = match v {
-                        serde_json::Value::String(s) => {
-                            let preview: String = s.chars().take(60).collect();
-                            if preview.len() < s.len() { format!("{}...", preview) } else { preview }
-                        }
-                        other => {
-                            let s = other.to_string();
-                            let preview: String = s.chars().take(60).collect();
-                            if preview.len() < s.len() { format!("{}...", preview) } else { preview }
-                        }
-                    };
-                    print!(" {}", dim(&format!("{}: {}", k, val_str)));
-                }
+        if !silent {
+            // Show tool calls header
+            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+            if !text.is_empty() {
+                println!();
             }
-            println!();
-        }
-        std::io::stdout().flush()?;
+            eprintln!(
+                "{}",
+                dim(&format!(
+                    "  tools: {}",
+                    tool_names.join(" · ")
+                ))
+            );
 
-        // Execute tool calls — parallel when multiple, sequential when single
+            // Display tool call previews
+            for tc in tool_calls.iter() {
+                print!("  {} {}", yellow("*"), bold(&tc.name));
+                if let Some(input_str) = tc.input.as_str() {
+                    let preview: String = input_str.chars().take(80).collect();
+                    if !preview.is_empty() {
+                        print!(" {}", dim(&preview));
+                    }
+                } else if let Some(obj) = tc.input.as_object() {
+                    if let Some((k, v)) = obj.iter().next() {
+                        let val_str = match v {
+                            serde_json::Value::String(s) => {
+                                let preview: String = s.chars().take(60).collect();
+                                if preview.len() < s.len() { format!("{}...", preview) } else { preview }
+                            }
+                            other => {
+                                let s = other.to_string();
+                                let preview: String = s.chars().take(60).collect();
+                                if preview.len() < s.len() { format!("{}...", preview) } else { preview }
+                            }
+                        };
+                        print!(" {}", dim(&format!("{}: {}", k, val_str)));
+                    }
+                }
+                println!();
+            }
+            std::io::stdout().flush()?;
+        }
+
+        // Execute tool calls — parallel when multiple
         let tool_results: Vec<(usize, flint_types::ToolOutput, std::time::Duration)> = {
             use futures::future::join_all;
             let futs: Vec<_> = tool_calls.iter().enumerate().map(|(i, tc)| {
                 let tc_name = &tc.name;
                 let tc_input = &tc.input;
+                // Use per-tool timeout if defined, otherwise default
+                let tool_timeout = registry.tool_timeout(tc_name)
+                    .unwrap_or(DEFAULT_TOOL_TIMEOUT);
                 async move {
                     let tool_start = Instant::now();
                     let output = tokio::time::timeout(
-                        DEFAULT_TOOL_TIMEOUT,
+                        tool_timeout,
                         registry.execute(tc_name, tc_input.clone(), ctx),
                     ).await;
                     let elapsed = tool_start.elapsed();
@@ -278,7 +325,7 @@ pub async fn run_turn(
                         Err(_) => flint_types::ToolOutput::error(format!(
                             "tool '{}' timed out after {} seconds",
                             tc_name,
-                            DEFAULT_TOOL_TIMEOUT.as_secs()
+                            tool_timeout.as_secs()
                         )),
                     };
                     (i, output, elapsed)
@@ -310,21 +357,23 @@ pub async fn run_turn(
             let sanitized = sanitize_preview(&output.text);
             let preview: String = sanitized.chars().take(200).collect();
             let truncated = if sanitized.len() > 200 { "..." } else { "" };
-            if output.is_error {
-                println!(
-                    "  {} {} {}",
-                    red("x"),
-                    preview,
-                    dim(&format!("({})", format_elapsed(tool_elapsed)))
-                );
-            } else {
-                println!(
-                    "  {} {}{} {}",
-                    green("+"),
-                    preview,
-                    truncated,
-                    dim(&format!("({})", format_elapsed(tool_elapsed)))
-                );
+            let mut print_result = !silent;
+            if let Some(cb) = &callback {
+                if !cb(&crate::AgentEvent::ToolCallEnd {
+                    name: tool_calls[i].name.clone(),
+                    success: !output.is_error,
+                    preview: preview.clone(),
+                    elapsed_ms: tool_elapsed.as_millis() as u64,
+                }) {
+                    print_result = false;
+                }
+            }
+            if print_result {
+                if output.is_error {
+                    println!("  {} {} {}", red("x"), preview, dim(&format!("({})", format_elapsed(tool_elapsed))));
+                } else {
+                    println!("  {} {}{} {}", green("+"), preview, truncated, dim(&format!("({})", format_elapsed(tool_elapsed))));
+                }
             }
             session.add_tool_result(&tool_calls[i].id, &output);
         }
@@ -336,18 +385,20 @@ pub async fn run_turn(
         }
 
         // Separator between tool execution and next LLM call
-        let so_far = turn_start.elapsed();
-        println!(
-            "{}",
-            dim(&format!(
-                "  ── turn {} · tool {}/{} · {} elapsed ──",
-                turn_iter,
-                tool_calls.len(),
-                tool_calls.len(),
-                format_elapsed(so_far)
-            ))
-        );
-        println!();
+        if !silent {
+            let so_far = turn_start.elapsed();
+            println!(
+                "{}",
+                dim(&format!(
+                    "  ── turn {} · tool {}/{} · {} elapsed ──",
+                    turn_iter,
+                    tool_calls.len(),
+                    tool_calls.len(),
+                    format_elapsed(so_far)
+                ))
+            );
+            println!();
+        }
     }
 
     // Reached via break (max_turns or cancel) — return what we have

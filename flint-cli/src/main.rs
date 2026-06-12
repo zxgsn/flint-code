@@ -192,6 +192,22 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 
     let mut system = prompt::build_system_prompt(&base_system, &config, working_dir);
 
+    // If running as a sub-agent, inject task completion instructions
+    if args.spawn_context.is_some() {
+        config.features.memory.auto_extract = false;
+        config.features.compaction.enabled = false;
+        system.push_str("\n\n## Task Completion\n\
+            You are a sub-agent. After completing your task, \
+            output your full result as text and end with `[TASK_COMPLETE]` on a new line. \
+            Do NOT write files unless explicitly asked. The coordinator receives your text directly.\n\n\
+            ## Tool Usage\n\
+            Always provide ALL required parameters:\n\
+            - `read`: requires `path`\n\
+            - `write`: requires `path` AND `content`\n\
+            - `edit`: requires `path`, `old_string`, AND `new_string`\n\
+            - `bash`: requires `command`");
+    }
+
     let mut registry = ToolRegistry::new();
     tools::register_builtins(&mut registry);
 
@@ -254,12 +270,69 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         });
     }
 
+    // Convert Provider to Arc for sharing with swarm sub-agents
+    let prov_arc: Arc<dyn Provider> = Arc::from(prov);
+
+    // Initialize swarm system (if enabled)
+    let (swarm, swarm_notify): (Option<Arc<Mutex<flint_swarm::SwarmManager>>>, _) =
+        if config.features.is_enabled(Feature::Swarm) {
+            let swarm_config = flint_swarm::SwarmConfig {
+                max_agents: config.features.swarm.max_agents,
+                agent_max_turns: config.features.swarm.agent_max_turns,
+                max_output_chars: config.agent.max_output_chars,
+                open_viewer: true,
+            };
+            let (output_tx, output_rx) = flint_swarm::output::channel();
+            tokio::spawn(flint_swarm::output::display_loop(output_rx));
+
+            let router = match flint_swarm::MessageRouter::start().await {
+                Ok(r) => {
+                    eprintln!("Router: listening on {}", r.addr);
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    eprintln!("Router: failed to start: {}", e);
+                    None
+                }
+            };
+
+            let sub_agent_registry = registry.clone();
+            let mut manager = flint_swarm::SwarmManager::new(
+                swarm_config,
+                prov_arc.clone(),
+                working_dir.to_path_buf(),
+                system.clone(),
+                output_tx,
+                sub_agent_registry,
+                router.clone(),
+            );
+            let notify_rx = manager.take_notify_rx();
+            let shared = Arc::new(Mutex::new(manager));
+            system = format!(
+                "{}\n\n## Swarm Mode\n\
+                You have access to sub-agents via the `swarm` tool.\n\n\
+                **How to use:**\n\
+                - `swarm spawn prompt=\"task\"` — spawns a sub-agent in a new terminal window.\n\
+                - For parallel work, call multiple `swarm spawn` in ONE message.\n\
+                - Sub-agent results are delivered AUTOMATICALLY when they complete.\n\
+                - Do NOT use swarm wait — results arrive as system messages.\n\
+                - After spawning, respond to the user immediately. Results will appear later.\n\n\
+                **Commands:** spawn, status, stop",
+                system
+            );
+            flint_swarm::register_swarm_tools(&mut registry, shared.clone(), router.clone());
+            eprintln!("Swarm: enabled (max {} agents)", config.features.swarm.max_agents);
+            (Some(shared), notify_rx)
+        } else {
+            (None, None)
+        };
+
     if let Some(prompt) = &args.prompt {
         // One-shot mode
         let mut session = Session::new();
         session.add_user(prompt);
         if let Err(e) = flint_agent::run_turn(
-            prov.as_ref(),
+            prov_arc.as_ref(),
             &mut session,
             &registry,
             &system,
@@ -267,6 +340,8 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             config.agent.max_turns,
             Some(cancel),
             config.agent.max_output_chars,
+            false,
+            None,
         )
         .await
         {
@@ -275,18 +350,36 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             std::process::exit(1);
         }
     } else {
-        // REPL mode
+        // REPL mode — inject conversation history from spawn context if available
+        let mut repl_session = Session::new();
+        if let Some(ref ctx_path) = args.spawn_context {
+            if let Ok(content) = std::fs::read_to_string(ctx_path) {
+                if let Ok(ctx) = serde_json::from_str::<flint_swarm::SpawnContext>(&content) {
+                    if let Some(ref history) = ctx.conversation_history {
+                        for msg in history {
+                            repl_session.messages.push(msg.clone());
+                        }
+                    }
+                }
+            }
+        }
         repl::run(
             config,
-            prov,
-            Session::new(),
-            &registry,
+            prov_arc,
+            repl_session,
+            registry,
             &system,
             &ctx,
             cancel,
             mcp_manager,
             working_dir,
             memory,
+            swarm,
+            swarm_notify,
+            args.initial_message.clone(),
+            args.message_file.clone(),
+            args.router_addr.clone(),
+            args.agent_id.clone(),
         )
         .await?;
     }
@@ -298,8 +391,35 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let working_dir = dunce::canonicalize(&cli.dir)?;
+
+    // --system-file: read system prompt from file
+    if let Some(ref path) = cli.system_file {
+        cli.system = Some(std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read system file '{}': {}", path, e))?);
+    }
+
+    // --initial-message-file: read initial message from file
+    if let Some(ref path) = cli.initial_message_file {
+        cli.initial_message = Some(std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read initial message file '{}': {}", path, e))?);
+    }
+
+    // Sub-agent mode: load SpawnContext and override CLI fields
+    if let Some(ref ctx_path) = cli.spawn_context {
+        let content = std::fs::read_to_string(ctx_path)
+            .map_err(|e| anyhow::anyhow!("failed to read spawn context '{}': {}", ctx_path, e))?;
+        let ctx: flint_swarm::SpawnContext = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("invalid spawn context JSON: {}", e))?;
+        cli.router_addr = Some(ctx.router_addr.clone());
+        cli.agent_id = Some(ctx.agent_id.clone());
+        cli.system = Some(ctx.system_prompt.clone());
+        cli.initial_message = Some(ctx.initial_prompt.clone());
+        std::env::set_var("FLINT_SUB_AGENT_ID", &ctx.agent_id);
+        std::env::set_var("FLINT_SUB_TASK_ID", &ctx.task_id);
+        std::env::set_var("FLINT_SUB_ROUTER_ADDR", &ctx.router_addr);
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -307,6 +427,15 @@ async fn main() -> Result<()> {
     }
 
     init_tracing("warn");
+
+    // Display client mode
+    if cli.display {
+        let addr = cli.router_addr.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--display requires --router-addr"))?;
+        let aid = cli.agent_id.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--display requires --agent-id"))?;
+        return repl::run_display_mode(addr, aid).await;
+    }
 
     match cli.command {
         Some(Commands::Config) => cmd_config(&working_dir),
@@ -318,7 +447,12 @@ async fn main() -> Result<()> {
                     prompt: cli.prompt,
                     provider: None,
                     model: None,
-                    system: None,
+                    system: cli.system,
+                    initial_message: cli.initial_message,
+                    message_file: cli.message_file,
+                    router_addr: cli.router_addr,
+                    agent_id: cli.agent_id,
+                    spawn_context: cli.spawn_context,
                 },
                 &working_dir,
             )

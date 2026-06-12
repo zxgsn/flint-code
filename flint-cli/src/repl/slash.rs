@@ -25,6 +25,7 @@ pub enum SlashAction {
     Mcp,
     Memory(Option<String>),
     Resume(Option<String>),
+    Swarm(Option<String>),
     Quit,
     Unknown(String),
 }
@@ -61,6 +62,10 @@ pub fn parse(input: &str) -> Option<SlashAction> {
             let arg = input[1..].split_whitespace().nth(1);
             SlashAction::Resume(arg.map(|s| s.to_string()))
         }
+        "swarm" => {
+            let arg = input[1..].split_whitespace().nth(1);
+            SlashAction::Swarm(arg.map(|s| s.to_string()))
+        }
         "quit" | "exit" | "q" => SlashAction::Quit,
         other => SlashAction::Unknown(other.to_string()),
     })
@@ -71,13 +76,15 @@ pub struct SlashContext<'a> {
     pub config: &'a mut flint_config::Config,
     pub session: &'a mut Session,
     pub current_session_meta: &'a mut Option<flint_agent::SessionMeta>,
-    pub prov: &'a mut Box<dyn Provider>,
-    pub registry: &'a ToolRegistry,
+    pub prov: &'a mut Arc<dyn Provider>,
+    pub registry: &'a mut ToolRegistry,
     pub ctx: &'a ToolContext,
     pub cancel: &'a Arc<AtomicBool>,
     pub mcp_manager: &'a mut McpManager,
     pub working_dir: &'a Path,
-    pub memory: &'a Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    pub memory: &'a mut Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    pub swarm: &'a mut Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    pub system: &'a str,
     pub turn_count: u32,
     pub total_tool_calls: u32,
 }
@@ -101,6 +108,54 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
         SlashAction::Config => {
             crate::cmd_config(sc.working_dir)?;
             *sc.config = flint_config::load(Some(sc.working_dir))?;
+
+            // Re-initialize memory if it was just enabled
+            if sc.config.features.is_enabled(flint_config::Feature::Memory) && sc.memory.is_none() {
+                let mem_config = flint_memory::MemoryConfig {
+                    max_core_blocks: sc.config.features.memory.max_core_blocks,
+                    max_block_chars: sc.config.features.memory.max_block_chars,
+                    auto_extract: sc.config.features.memory.auto_extract,
+                    search_limit: sc.config.features.memory.search_limit,
+                    ..Default::default()
+                };
+                match flint_memory::MemoryManager::new(mem_config, Some(sc.working_dir)) {
+                    Ok(mm) => {
+                        let shared = Arc::new(Mutex::new(mm));
+                        crate::tools::register_memory_tools(sc.registry, shared.clone());
+                        *sc.memory = Some(shared);
+                        eprintln!("Memory: enabled (core + archival)");
+                    }
+                    Err(e) => eprintln!("Memory: failed to initialize: {}", e),
+                }
+            }
+
+            // Re-initialize swarm if it was just enabled
+            if sc.config.features.is_enabled(flint_config::Feature::Swarm) && sc.swarm.is_none() {
+                let swarm_config = flint_swarm::SwarmConfig {
+                    max_agents: sc.config.features.swarm.max_agents,
+                    agent_max_turns: sc.config.features.swarm.agent_max_turns,
+                    max_output_chars: sc.config.agent.max_output_chars,
+                    open_viewer: true,
+                };
+                let (output_tx, output_rx) = flint_swarm::output::channel();
+                tokio::spawn(flint_swarm::output::display_loop(output_rx));
+                // Clone registry before registering swarm tool
+                let sub_agent_registry = sc.registry.clone();
+                let manager = flint_swarm::SwarmManager::new(
+                    swarm_config,
+                    sc.prov.clone(),
+                    sc.working_dir.to_path_buf(),
+                    sc.system.to_string(),
+                    output_tx,
+                    sub_agent_registry,
+                    None, // No router when initializing from slash command
+                );
+                let shared = Arc::new(Mutex::new(manager));
+                flint_swarm::register_swarm_tools(sc.registry, shared.clone(), None);
+                *sc.swarm = Some(shared);
+                eprintln!("Swarm: enabled (max {} agents)", sc.config.features.swarm.max_agents);
+            }
+
             println!();
         }
         SlashAction::Setup => {
@@ -159,6 +214,9 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
         SlashAction::Memory(sub) => {
             dispatch_memory(sub, sc);
         }
+        SlashAction::Swarm(sub) => {
+            dispatch_swarm(sub, sc);
+        }
         SlashAction::Unknown(cmd) => {
             println!(
                 "Unknown command: /{}\nType /help for available commands.\n",
@@ -208,6 +266,8 @@ async fn dispatch_compact(sc: &mut SlashContext<'_>) -> Result<()> {
         5,
         None,
         65536,
+        true, // silent
+        None,
     )
     .await
     {
@@ -327,7 +387,7 @@ async fn dispatch_resume(arg: Option<String>, sc: &mut SlashContext<'_>) -> Resu
 /// /setup — configure provider
 fn dispatch_setup(sc: &mut SlashContext<'_>) -> Result<()> {
     let env_path = sc.working_dir.join(".env");
-    crate::setup_ui::run(&env_path)?;
+    crate::setup_ui::run_edit(&env_path)?;
     provider::load_env_override(&env_path);
     let p_type = std::env::var("FLINT_PROVIDER")
         .unwrap_or_else(|_| sc.config.provider.r#type.clone());
@@ -335,7 +395,7 @@ fn dispatch_setup(sc: &mut SlashContext<'_>) -> Result<()> {
         std::env::var("FLINT_MODEL").unwrap_or_else(|_| sc.config.provider.model.clone());
     match provider::build_provider(&p_type, &p_model) {
         Ok(p) => {
-            *sc.prov = p;
+            *sc.prov = Arc::from(p);
             sc.config.provider.r#type = p_type;
             sc.config.provider.model = p_model;
             println!("Provider reloaded.\n");
@@ -350,7 +410,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
     match name {
         Some(m) => match provider::build_provider(&sc.config.provider.r#type, &m) {
             Ok(p) => {
-                *sc.prov = p;
+                *sc.prov = Arc::from(p);
                 sc.config.provider.model = m.clone();
                 println!("Switched to model: {}\n", m);
             }
@@ -368,7 +428,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                                 .unwrap_or_else(|_| sc.config.provider.r#type.clone());
                             match provider::build_provider(&p_type, &m) {
                                 Ok(p) => {
-                                    *sc.prov = p;
+                                    *sc.prov = Arc::from(p);
                                     sc.config.provider.r#type = p_type;
                                     sc.config.provider.model = m.clone();
                                     println!("Switched to model: {}\n", m);
@@ -382,7 +442,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                 } else {
                     match provider::build_provider(&sc.config.provider.r#type, &m) {
                         Ok(p) => {
-                            *sc.prov = p;
+                            *sc.prov = Arc::from(p);
                             sc.config.provider.model = m.clone();
                             println!("Switched to model: {}\n", m);
                         }
@@ -474,6 +534,140 @@ Use /memory help for all commands.\n",
                 project,
                 global,
                 core + project + global
+            );
+        }
+    }
+}
+
+/// /swarm — show swarm status
+fn dispatch_swarm(sub: Option<String>, sc: &mut SlashContext<'_>) {
+    let swarm = match sc.swarm {
+        Some(s) => s,
+        None => {
+            println!("Swarm is disabled. Enable it in config: [features.swarm] enabled = true\n");
+            return;
+        }
+    };
+
+    match sub.as_deref() {
+        Some(s) if s.starts_with("spawn") => {
+            // /swarm spawn <prompt> — directly spawn a terminal sub-agent for testing
+            let prompt = s.strip_prefix("spawn").unwrap_or("").trim();
+            let prompt = if prompt.is_empty() {
+                "Hello from the coordinator! Please introduce yourself and confirm you are running in a new terminal."
+                    .to_string()
+            } else {
+                prompt.to_string()
+            };
+            let mut sm = swarm.lock().unwrap();
+            match sm.spawn_terminal(prompt, None, false) {
+                Ok(result) => {
+                    println!(
+                        "Spawned terminal agent [{}] (task {})\n\
+                         A new terminal window should appear.\n\
+                         Use /swarm status to check progress.\n",
+                        &result.agent_id[result.agent_id.len()-4..],
+                        result.task_id,
+                    );
+                }
+                Err(e) => {
+                    println!("Spawn failed: {}\n", e);
+                }
+            }
+        }
+        Some("status") | Some("st") => {
+            let sm = swarm.lock().unwrap();
+            let agents = sm.agent_status();
+            let tasks = sm.task_status();
+            println!(
+                "Swarm: {} active agents, {} tasks\n",
+                sm.active_agent_count(),
+                tasks.len()
+            );
+            if !agents.is_empty() {
+                println!("Agents:");
+                for (id, status, task_id) in &agents {
+                    let task_info = task_id
+                        .as_ref()
+                        .map(|t| format!(" -> {}", t))
+                        .unwrap_or_default();
+                    println!("  {} [{}]{}", id, status, task_info);
+                }
+                println!();
+            }
+            if !tasks.is_empty() {
+                println!("Tasks:");
+                for task in &tasks {
+                    println!("  {} [{}]: {}", task.id, task.status, task.content);
+                }
+                println!();
+            }
+        }
+        Some("tasks") => {
+            let sm = swarm.lock().unwrap();
+            let tasks = sm.task_status();
+            if tasks.is_empty() {
+                println!("No tasks.\n");
+            } else {
+                println!("{} tasks:\n", tasks.len());
+                for task in &tasks {
+                    let result = task
+                        .result
+                        .as_ref()
+                        .map(|r| {
+                            let preview = if r.len() > 80 {
+                                format!("{}...", &r[..80])
+                            } else {
+                                r.clone()
+                            };
+                            format!(" -> {}", preview)
+                        })
+                        .unwrap_or_default();
+                    println!("  {} [{}]{}: {}", task.id, task.status, result, task.content);
+                }
+                println!();
+            }
+        }
+        Some("viewer") | Some("view") => {
+            flint_swarm::log::open_viewer();
+            println!(
+                "Opened viewer ({})\nLogs: {}\n",
+                flint_swarm::log::viewer_mode_name(),
+                flint_swarm::log::log_dir().display()
+            );
+        }
+        Some("help") => {
+            println!(
+                "\
+Swarm commands:
+  /swarm              Show swarm status
+  /swarm spawn [task] Spawn terminal sub-agent (for testing)
+  /swarm status       Show agents and tasks
+  /swarm tasks        List all tasks
+  /swarm viewer       Open log viewer window
+  /swarm help         Show this help
+
+Swarm tools (available to the agent):
+  swarm spawn    Spawn sub-agent (in-process, interactive, or terminal)
+  swarm status   Check agent and task status
+  swarm stop     Stop an agent or all agents
+  swarm list     List all tasks
+  swarm viewer   Open a terminal window tailing sub-agent logs
+  swarm clean    Delete log files
+
+Logs are saved to ~/.flint/swarm-logs/\n"
+            );
+        }
+        _ => {
+            // Default: show status
+            let sm = swarm.lock().unwrap();
+            let tasks = sm.task_status();
+            println!(
+                "Swarm Status:\n  Active agents: {}\n  Total tasks: {}\n\n\
+                 Use /swarm status for details.\n\
+                 Use /swarm help for all commands.\n",
+                sm.active_agent_count(),
+                tasks.len()
             );
         }
     }

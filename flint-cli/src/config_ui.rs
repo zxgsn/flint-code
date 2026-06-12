@@ -66,6 +66,12 @@ impl App {
                 description: "Safety confirmations",
                 enabled: config.features.is_enabled(Feature::Permissions),
             },
+            FeatureItem {
+                feature: Feature::Swarm,
+                label: "Swarm",
+                description: "Multi-agent coordination",
+                enabled: config.features.is_enabled(Feature::Swarm),
+            },
         ];
 
         let mut list_state = ListState::default();
@@ -108,6 +114,7 @@ impl App {
                 Feature::Memory => self.config.features.memory.enabled = item.enabled,
                 Feature::Compaction => self.config.features.compaction.enabled = item.enabled,
                 Feature::Permissions => self.config.features.permissions.enabled = item.enabled,
+                Feature::Swarm => self.config.features.swarm.enabled = item.enabled,
             }
         }
     }

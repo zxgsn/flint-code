@@ -58,7 +58,15 @@ pub struct InitializeResult {
 #[derive(Debug, Deserialize)]
 pub struct ServerCapabilities {
     pub tools: Option<ToolsCapability>,
+    pub resources: Option<ResourcesCapability>,
+    pub prompts: Option<PromptsCapability>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ResourcesCapability {}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptsCapability {}
 
 #[derive(Debug, Deserialize)]
 pub struct ToolsCapability {}
@@ -103,6 +111,90 @@ pub struct CallToolResult {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { data: String, #[serde(rename = "mimeType")] mime_type: String },
+    #[serde(rename = "resource")]
+    Resource { resource: serde_json::Value },
+}
+
+// ── MCP: resources/list ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ListResourcesResult {
+    pub resources: Vec<ResourceInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResourceInfo {
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: String,
+}
+
+// ── MCP: resources/read ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ReadResourceResult {
+    pub contents: Vec<ResourceContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResourceContent {
+    #[serde(rename = "text")]
+    Text { text: String, uri: String, #[serde(rename = "mimeType", default)] mime_type: String },
+    #[serde(rename = "blob")]
+    Blob { blob: String, uri: String, #[serde(rename = "mimeType", default)] mime_type: String },
+}
+
+// ── MCP: prompts/list ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ListPromptsResult {
+    pub prompts: Vec<PromptInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+// ── MCP: prompts/get ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GetPromptResult {
+    #[serde(default)]
+    pub description: String,
+    pub messages: Vec<PromptMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptMessage {
+    pub role: String,
+    pub content: PromptMessageContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum PromptMessageContent {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]

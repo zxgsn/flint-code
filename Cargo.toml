@@ -6,6 +6,7 @@ members = [
     "flint-agent",
     "flint-memory",
     "flint-mcp",
+    "flint-swarm",
     "flint-cli",
 ]
 resolver = "2"
@@ -22,6 +23,7 @@ flint-provider = { path = "flint-provider" }
 flint-agent   = { path = "flint-agent" }
 flint-memory  = { path = "flint-memory" }
 flint-mcp     = { path = "flint-mcp" }
+flint-swarm   = { path = "flint-swarm" }
 
 tokio       = { version = "1", features = ["full"] }
 reqwest     = { version = "0.12", features = ["json", "stream", "rustls-tls"] }

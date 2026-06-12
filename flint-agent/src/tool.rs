@@ -6,8 +6,10 @@ use flint_types::{ToolDefinition, ToolOutput};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Context passed to tool execution.
+#[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
 }
@@ -20,24 +22,36 @@ pub struct ToolContext {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput>;
+
+    /// Custom timeout for this tool. Override for long-running tools like swarm spawn.
+    /// Returns None to use the default timeout (120s).
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Registry of available tools.
+///
+/// The internal map is wrapped in `Arc` so registries can be cheaply cloned.
+/// Cloned registries share the same tool instances — registering a tool on one
+/// clone makes it visible to all others.
+#[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: Arc<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: Arc::new(HashMap::new()),
         }
     }
 
-    /// Register a tool.
+    /// Register a tool. Uses `Arc::make_mut` — if this registry is a clone
+    /// sharing the map with others, the map is copied-on-write.
     pub fn register(&mut self, tool: impl Tool + 'static) {
         let def = tool.definition();
-        self.tools.insert(def.name, Arc::new(tool));
+        Arc::make_mut(&mut self.tools).insert(def.name, Arc::new(tool));
     }
 
     /// Get tool definitions for the LLM request.
@@ -58,9 +72,14 @@ impl ToolRegistry {
         }
     }
 
+    /// Get the custom timeout for a tool, or None for default.
+    pub fn tool_timeout(&self, name: &str) -> Option<Duration> {
+        self.tools.get(name).and_then(|t| t.timeout())
+    }
+
     /// Remove a tool by name. Returns true if it existed.
     pub fn remove(&mut self, name: &str) -> bool {
-        self.tools.remove(name).is_some()
+        Arc::make_mut(&mut self.tools).remove(name).is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -69,6 +88,11 @@ impl ToolRegistry {
 
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    /// List all registered tool names.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
     }
 }
 

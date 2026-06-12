@@ -1,5 +1,6 @@
 //! REPL loop: input reading, command dispatch, LLM interaction, session management.
 
+pub mod render;
 pub mod shell;
 pub mod slash;
 
@@ -18,15 +19,21 @@ use crate::prompt;
 /// Run the interactive REPL loop.
 pub async fn run(
     mut config: flint_config::Config,
-    mut prov: Box<dyn Provider>,
+    mut prov: Arc<dyn Provider>,
     mut session: Session,
-    registry: &ToolRegistry,
+    mut registry: ToolRegistry,
     system: &str,
     ctx: &ToolContext,
     cancel: Arc<AtomicBool>,
     mut mcp_manager: McpManager,
     working_dir: &Path,
-    memory: Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    mut memory: Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    mut swarm: Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    swarm_notify: Option<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>,
+    initial_message: Option<String>,
+    message_file: Option<String>,
+    router_addr: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<()> {
     println!(
         "flint v{} -- {} / {}",
@@ -54,23 +61,311 @@ pub async fn run(
         );
     }
 
+    if let Some(ref sw) = swarm {
+        let sm = sw.lock().unwrap();
+        println!(
+            "Swarm: enabled (max {} agents) -- /swarm to manage",
+            sm.config().max_agents
+        );
+    }
+
     println!();
 
     let mut current_session_meta: Option<flint_agent::SessionMeta> = None;
     let mut turn_count: u32 = 0;
     let mut total_tool_calls: u32 = 0;
 
+    // Detect sub-agent mode (spawned in new terminal)
+    let sub_agent_mode = std::env::var("FLINT_SUB_AGENT_ID").is_ok();
+    let mut result_delivered = false; // Track if result has been delivered for current task
+
+    // Wrap swarm_notify in Arc<Mutex> so the run_turn callback can drain it
+    let swarm_notify_shared: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>> =
+        swarm_notify.map(|rx| Arc::new(Mutex::new(rx)));
+
+    // Get router Arc for real-time result checking (coordinator side)
+    let router_arc_for_results: Option<Arc<flint_swarm::MessageRouter>> = swarm.as_ref()
+        .and_then(|sw| sw.lock().unwrap().router_arc());
+
+    // Background task: drain router results into a shared buffer every 100ms.
+    // Stops automatically when the stop flag is set (all agents completed).
+    let results_buffer: Arc<Mutex<Vec<flint_swarm::AgentResult>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let poll_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(ref router) = router_arc_for_results {
+        let buf = results_buffer.clone();
+        let r = router.clone();
+        let active = poll_active.clone();
+        active.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            while active.load(std::sync::atomic::Ordering::Relaxed) {
+                let drained = r.drain_results().await;
+                if !drained.is_empty() {
+                    buf.lock().unwrap().extend(drained);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    // Connect to router if address provided (for sub-agents)
+    let mut router_endpoint: Option<flint_swarm::endpoint::AgentEndpoint> = None;
+    if let (Some(ref addr), Some(ref id)) = (&router_addr, &agent_id) {
+        match flint_swarm::endpoint::AgentEndpoint::connect(addr, id).await {
+            Ok(ep) => {
+                eprintln!("\x1b[36m  [router] Connected to message router as {}\x1b[0m", id);
+                router_endpoint = Some(ep);
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m  [router] Failed to connect: {}\x1b[0m", e);
+            }
+        }
+    }
+
+    // Process initial message if provided (e.g., from --initial-message flag)
+    if let Some(ref msg) = initial_message {
+        turn_count += 1;
+        eprintln!("\x1b[34m{}>\x1b[0m {}", turn_count, msg);
+        session.add_user(msg);
+        cancel.store(false, Ordering::Relaxed);
+
+        let effective_system = system.to_string();
+        match run_turn(
+            prov.as_ref(),
+            &mut session,
+            &registry,
+            &effective_system,
+            ctx,
+            config.agent.max_turns,
+            Some(cancel.clone()),
+            config.agent.max_output_chars,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok((_text, stats)) => {
+                total_tool_calls += stats.tool_calls;
+
+                // Sub-agent: check for [TASK_COMPLETE] in initial message response
+                if sub_agent_mode {
+                    let last_text = session.messages.iter().rev()
+                        .find(|m| m.role == flint_types::Role::Assistant)
+                        .map(|m| m.text())
+                        .unwrap_or_default();
+                    if last_text.contains("[TASK_COMPLETE]") {
+                        let result = last_text.replace("[TASK_COMPLETE]", "").trim().to_string();
+                        deliver_sub_agent_result(&result, &mut router_endpoint, working_dir).await;
+                        result_delivered = true;
+                        eprintln!("\x1b[32m  [task complete] Result delivered to coordinator.\x1b[0m");
+                        eprintln!("\x1b[90m  Waiting for follow-up tasks...\x1b[0m");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e);
+            }
+        }
+        println!();
+    }
+
     loop {
+        // Check for pending messages from the coordinator
+        // Priority: router (real-time) > file (fallback)
+        let pending_message = if let Some(ref mut ep) = router_endpoint {
+            // Try non-blocking read from router
+            match ep.try_read_message().await {
+                Ok(Some(flint_swarm::router::RouterMessage::Incoming { from, content })) => {
+                    Some((from, content))
+                }
+                Ok(Some(flint_swarm::router::RouterMessage::Stop { .. })) => {
+                    eprintln!("\x1b[31m  [router] Received stop signal\x1b[0m");
+                    break;
+                }
+                Ok(Some(_)) => None, // Ignore other messages
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("\x1b[33m  [router] Read error: {}\x1b[0m", e);
+                    None
+                }
+            }
+        } else if let Some(ref msg_path) = message_file {
+            // Fallback: file-based communication
+            std::fs::read_to_string(msg_path).ok().and_then(|content| {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    let _ = std::fs::write(msg_path, "");
+                    Some(("coordinator".to_string(), trimmed))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        if let Some((from, content)) = pending_message {
+            eprintln!("\x1b[36m  [{}]\x1b[0m {}", from, content);
+            result_delivered = false; // New task from coordinator
+            session.messages.push(flint_types::Message::system(
+                &format!("[Message from {}]: {}", from, content)
+            ));
+            turn_count += 1;
+            let effective_system = system.to_string();
+            match run_turn(
+                prov.as_ref(), &mut session, &registry, &effective_system, ctx,
+                config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
+                false, None,
+            ).await {
+                Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
+                Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
+            }
+            println!();
+        }
+
+        // Restart polling if agents are active
+        if let Some(ref sw) = swarm {
+            let active = sw.lock().unwrap().active_agent_count();
+            if active > 0 && !poll_active.load(std::sync::atomic::Ordering::Relaxed) {
+                poll_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ref router) = router_arc_for_results {
+                    let buf = results_buffer.clone();
+                    let r = router.clone();
+                    let pa = poll_active.clone();
+                    tokio::spawn(async move {
+                        while pa.load(std::sync::atomic::Ordering::Relaxed) {
+                            let drained = r.drain_results().await;
+                            if !drained.is_empty() {
+                                buf.lock().unwrap().extend(drained);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    });
+                }
+            }
+        }
+
         print!("\u{276f} ");
         std::io::stdout().flush()?;
 
-        let input = match crate::input::read_line()? {
-            crate::input::InputResult::Line(line) => line,
-            crate::input::InputResult::Exit => {
-                println!("Bye.");
-                break;
+        // Use read_line_with_handler to process sub-agent input requests
+        // and pending results while waiting for user keystrokes.
+        // The handler is called every ~100ms during the poll timeout.
+        // Check for pending sub-agent results BEFORE waiting for input.
+        // If results arrived while idle, process them immediately without waiting for Enter.
+        let mut collected_results: Vec<flint_swarm::AgentResult> =
+            results_buffer.lock().unwrap().drain(..).collect();
+
+        let input = if !collected_results.is_empty() {
+            // Results pending — skip input, process results immediately
+            for r in &collected_results {
+                let short_id = r.agent_id.strip_prefix("agent_").unwrap_or(&r.agent_id);
+                let short_id = &short_id[..4.min(short_id.len())];
+                eprintln!("\n\x1b[36m  [result from {}] received\x1b[0m", short_id);
+            }
+            String::new()
+        } else {
+            // No results — wait for user input
+            let handler_swarm = &swarm;
+            let handler_buf = results_buffer.clone();
+            let handler_collected = Arc::new(Mutex::new(Vec::<flint_swarm::AgentResult>::new()));
+            let hc = handler_collected.clone();
+            match crate::input::read_line_with_handler(|| {
+                // Drain input requests from sub-agents
+                let requests = if let Some(ref sw) = handler_swarm {
+                    let sm = sw.lock().unwrap();
+                    sm.drain_input_requests()
+                } else {
+                    return;
+                };
+                for req in &requests {
+                    let short_id = req.agent_id.strip_prefix("agent_").unwrap_or(&req.agent_id);
+                    let short_id = &short_id[..4.min(short_id.len())];
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    eprintln!();
+                    eprintln!("\x1b[36m  [{}] asks:\x1b[0m {}", short_id, req.prompt);
+                    print!("\x1b[36m  > \x1b[0m");
+                    let _ = std::io::stdout().flush();
+                    let mut response = String::new();
+                    if std::io::stdin().read_line(&mut response).is_ok() {
+                        let response_text = response.trim().to_string();
+                        let response_tx = {
+                            let sm = handler_swarm.as_ref().unwrap().lock().unwrap();
+                            sm.get_input_response_tx(&req.agent_id)
+                        };
+                        if let Some(tx) = response_tx {
+                            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                                let _ = rt.block_on(tx.send(
+                                    flint_swarm::InputResponse { text: response_text }
+                                ));
+                            }
+                        }
+                    }
+                    let _ = crossterm::terminal::enable_raw_mode();
+                    print!("\u{276f} ");
+                    let _ = std::io::stdout().flush();
+                }
+                // Check results buffer during input wait
+                if let Ok(mut buf) = handler_buf.try_lock() {
+                    if !buf.is_empty() {
+                        let drained: Vec<_> = buf.drain(..).collect();
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        for r in &drained {
+                            let short_id = r.agent_id.strip_prefix("agent_").unwrap_or(&r.agent_id);
+                            let short_id = &short_id[..4.min(short_id.len())];
+                            eprintln!("\n\x1b[36m  [result from {}] received\x1b[0m", short_id);
+                        }
+                        let _ = crossterm::terminal::enable_raw_mode();
+                        hc.lock().unwrap().extend(drained);
+                    }
+                }
+            })? {
+                crate::input::InputResult::Line(line) => {
+                    // Merge any results collected during input wait
+                    collected_results.extend(handler_collected.lock().unwrap().drain(..));
+                    line
+                }
+                crate::input::InputResult::Exit => {
+                    println!("Bye.");
+                    break;
+                }
             }
         };
+        if !collected_results.is_empty() {
+            for r in collected_results {
+                {
+                    let mut sm = swarm.as_ref().unwrap().lock().unwrap();
+                    sm.complete_task(&r.task_id, &r.result, true);
+                }
+                let short_id = r.agent_id.strip_prefix("agent_").unwrap_or(&r.agent_id);
+                let short_id = &short_id[..4.min(short_id.len())];
+                let result_msg = format!(
+                    "[Sub-agent {} completed task {}]\n{}",
+                    short_id, &r.task_id[..8.min(r.task_id.len())], r.result
+                );
+                session.messages.push(flint_types::Message::system(&result_msg));
+                turn_count += 1;
+                let effective_system = system.to_string();
+                match run_turn(
+                    prov.as_ref(), &mut session, &registry, &effective_system, ctx,
+                    config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
+                    false, None,
+                ).await {
+                    Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
+                    Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
+                }
+                println!();
+            }
+            // Check if all agents are done — stop polling
+            if let Some(ref sw) = swarm {
+                let active = sw.lock().unwrap().active_agent_count();
+                if active == 0 {
+                    poll_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            continue; // Re-show prompt after processing results
+        }
+
         let input = input.trim().to_string();
 
         if input.is_empty() {
@@ -90,12 +385,14 @@ pub async fn run(
                 session: &mut session,
                 current_session_meta: &mut current_session_meta,
                 prov: &mut prov,
-                registry,
+                registry: &mut registry,
                 ctx,
                 cancel: &cancel,
                 mcp_manager: &mut mcp_manager,
                 working_dir,
-                memory: &memory,
+                memory: &mut memory,
+                swarm: &mut swarm,
+                system,
                 turn_count,
                 total_tool_calls,
             };
@@ -135,15 +432,27 @@ pub async fn run(
         // Remember the last assistant message index for extraction
         let pre_turn_msg_count = session.messages.len();
 
+        // Callback that drains sub-agent notifications and stream output in real-time
+        // during run_turn, so the user sees progress without waiting for the turn to end.
+        let cb_notify = swarm_notify_shared.clone();
+        let cb_swarm = swarm.clone();
+        let turn_callback: flint_agent::EventCallback = Box::new(move |_event| {
+            drain_and_display_notifications_sync(&cb_notify, &cb_swarm);
+            drain_and_display_streams_sync(&cb_swarm);
+            true
+        });
+
         match run_turn(
             prov.as_ref(),
             &mut session,
-            registry,
+            &registry,
             &effective_system,
             ctx,
             config.agent.max_turns,
             Some(cancel.clone()),
             config.agent.max_output_chars,
+            false,
+            Some(&turn_callback),
         )
         .await
         {
@@ -157,17 +466,84 @@ pub async fn run(
                             mem,
                             &session,
                             pre_turn_msg_count,
-                            &mut prov,
-                            registry,
+                            &*prov,
+                            &registry,
                             ctx,
                         )
                         .await;
+                    }
+                }
+
+                // Sub-agent task completion: check if the last assistant message
+                // contains [TASK_COMPLETE]. If so, deliver result but stay alive
+                // for follow-up tasks from the coordinator.
+                if sub_agent_mode && !result_delivered {
+                    let last_text = session.messages.iter().rev()
+                        .find(|m| m.role == flint_types::Role::Assistant)
+                        .map(|m| m.text())
+                        .unwrap_or_default();
+                    if last_text.contains("[TASK_COMPLETE]") {
+                        let result = last_text.replace("[TASK_COMPLETE]", "").trim().to_string();
+                        deliver_sub_agent_result(&result, &mut router_endpoint, working_dir).await;
+                        result_delivered = true;
+                        eprintln!("\n\x1b[32m  [task complete] Result delivered.\x1b[0m");
+                        eprintln!("\x1b[90m  Waiting for follow-up tasks...\x1b[0m");
                     }
                 }
             }
             Err(e) => {
                 eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e);
                 eprintln!("  Type /setup to reconfigure provider, or /model to switch model.\n");
+            }
+        }
+
+        // Drain sub-agent completion notifications and display to user
+        drain_and_display_notifications(
+            &swarm_notify_shared,
+            &swarm,
+        );
+
+        // Drain streaming output from interactive agents
+        if let Some(ref sw) = swarm {
+            let stream_chunks = {
+                let sm = sw.lock().unwrap();
+                sm.drain_all_streams()
+            };
+            for (agent_id, chunk) in &stream_chunks {
+                let short_id = agent_id.strip_prefix("agent_").unwrap_or(agent_id);
+                let short_id = &short_id[..4.min(short_id.len())];
+
+                if chunk.starts_with("[INPUT_REQUESTED:") {
+                    let prompt = chunk
+                        .strip_prefix("[INPUT_REQUESTED:")
+                        .unwrap_or(chunk)
+                        .trim_end_matches(']');
+                    eprintln!();
+                    eprintln!("\x1b[36m  [{}] asks:\x1b[0m {}", short_id, prompt);
+                    print!("\x1b[36m  > \x1b[0m");
+                    std::io::stdout().flush()?;
+                    let user_input = match crate::input::read_line()? {
+                        crate::input::InputResult::Line(line) => line,
+                        crate::input::InputResult::Exit => String::new(),
+                    };
+                    let response_tx = {
+                        let sm = sw.lock().unwrap();
+                        sm.get_input_response_tx(agent_id)
+                    };
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(flint_swarm::InputResponse { text: user_input }).await;
+                    }
+                } else if chunk == "[DONE]" {
+                    eprintln!("\x1b[32m  [{}] Done.\x1b[0m", short_id);
+                } else if chunk.starts_with("[TOOL:") {
+                    eprintln!("\x1b[90m  {}\x1b[0m", chunk);
+                } else {
+                    let mut buf = Vec::new();
+                    render::render_markdown(&mut buf, chunk);
+                    let rendered = String::from_utf8_lossy(&buf);
+                    print!("{}", rendered);
+                    std::io::stdout().flush()?;
+                }
             }
         }
 
@@ -183,8 +559,8 @@ pub async fn run(
                 dispatch_auto_compact(
                     &mut session,
                     &mut current_session_meta,
-                    &mut prov,
-                    registry,
+                    &*prov,
+                    &registry,
                     ctx,
                 )
                 .await;
@@ -227,7 +603,7 @@ pub async fn run(
 async fn dispatch_auto_compact(
     session: &mut Session,
     current_session_meta: &mut Option<flint_agent::SessionMeta>,
-    prov: &mut Box<dyn Provider>,
+    prov: &dyn Provider,
     registry: &ToolRegistry,
     ctx: &ToolContext,
 ) {
@@ -255,7 +631,7 @@ async fn dispatch_auto_compact(
     let mut compact_session = Session::new();
     compact_session.add_user(&compact_prompt);
     match run_turn(
-        prov.as_ref(),
+        prov,
         &mut compact_session,
         registry,
         "You are a summarizer. Be concise.",
@@ -263,6 +639,8 @@ async fn dispatch_auto_compact(
         5,
         None,
         65536,
+        true, // silent
+        None,
     )
     .await
     {
@@ -302,7 +680,7 @@ async fn auto_extract_memories(
     memory: &Arc<Mutex<flint_memory::MemoryManager>>,
     session: &Session,
     pre_turn_msg_count: usize,
-    prov: &mut Box<dyn Provider>,
+    prov: &dyn Provider,
     registry: &ToolRegistry,
     ctx: &ToolContext,
 ) {
@@ -343,7 +721,7 @@ async fn auto_extract_memories(
     extract_session.add_user(&extract_prompt);
 
     match run_turn(
-        prov.as_ref(),
+        prov,
         &mut extract_session,
         registry,
         "You are a memory extraction system. Output only valid JSON.",
@@ -351,6 +729,8 @@ async fn auto_extract_memories(
         3,
         None,
         65536,
+        true, // silent
+        None,
     )
     .await
     {
@@ -379,6 +759,316 @@ async fn auto_extract_memories(
         }
         Err(e) => {
             tracing::warn!("memory extraction failed: {}", e);
+        }
+    }
+}
+
+/// Display and interact with an interactive agent's streaming output.
+/// Called after `swarm spawn` creates an interactive agent.
+/// Polls the agent's stream channel, displays output with markdown rendering,
+/// and forwards user input when the agent requests it.
+pub async fn display_agent_output(
+    swarm: &std::sync::Arc<std::sync::Mutex<flint_swarm::SwarmManager>>,
+    agent_id: &str,
+) -> Result<()> {
+    let short_id = agent_id.strip_prefix("agent_").unwrap_or(agent_id);
+    let short_id = &short_id[..4.min(short_id.len())];
+
+    eprintln!("\x1b[36m  [{}] Working...\x1b[0m", short_id);
+
+    loop {
+        // Drain streaming output
+        let chunks = {
+            let sm = swarm.lock().unwrap();
+            sm.drain_stream(agent_id)
+        };
+
+        let mut done = false;
+        for chunk in &chunks {
+            // Check for special markers
+            if chunk.starts_with("[INPUT_REQUESTED:") {
+                // Agent needs user input
+                let prompt = chunk
+                    .strip_prefix("[INPUT_REQUESTED:")
+                    .unwrap_or(chunk)
+                    .trim_end_matches(']');
+                eprintln!();
+                eprintln!("\x1b[36m  [{}] asks:\x1b[0m {}", short_id, prompt);
+                print!("\x1b[36m  > \x1b[0m");
+                std::io::stdout().flush()?;
+
+                let user_input = match crate::input::read_line()? {
+                    crate::input::InputResult::Line(line) => line,
+                    crate::input::InputResult::Exit => String::new(),
+                };
+
+                // Send response to the agent
+                let response_tx = {
+                    let sm = swarm.lock().unwrap();
+                    sm.get_input_response_tx(agent_id)
+                };
+                if let Some(tx) = response_tx {
+                    let _ = tx.send(flint_swarm::InputResponse { text: user_input }).await;
+                }
+            } else if chunk == "[DONE]" {
+                done = true;
+            } else if chunk.starts_with("[TOOL:") {
+                // Tool summary — render dimmed
+                eprintln!("\x1b[90m  {}\x1b[0m", chunk);
+            } else {
+                // Regular text — render with markdown
+                let mut buf = Vec::new();
+                render::render_markdown(&mut buf, chunk);
+                let rendered = String::from_utf8_lossy(&buf);
+                print!("{}", rendered);
+                std::io::stdout().flush()?;
+            }
+        }
+
+        if done {
+            eprintln!();
+            eprintln!("\x1b[32m  [{}] Done.\x1b[0m", short_id);
+            break;
+        }
+
+        // Small delay to avoid busy-waiting
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(())
+}
+
+/// Display client mode: thin terminal that connects to a swarm agent via router.
+///
+/// This is the jcode-style architecture: the agent runs as a tokio task on the
+/// server, and this client displays its output and forwards user input — all
+/// communication happens over TCP via the MessageRouter.
+pub async fn run_display_mode(router_addr: &str, agent_id: &str) -> Result<()> {
+    use flint_swarm::endpoint::AgentEndpoint;
+    use flint_swarm::router::RouterMessage;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Connect to the router
+    let mut ep = AgentEndpoint::connect(router_addr, agent_id).await?;
+
+    let short_id = agent_id.strip_prefix("agent_").unwrap_or(agent_id);
+    let short_id = &short_id[..4.min(short_id.len())];
+    eprintln!("\x1b[36m  [{}] Connected to agent via router\x1b[0m", short_id);
+    eprintln!("\x1b[90m  Type messages to send to the agent. Ctrl+C to exit.\x1b[0m\n");
+
+    // Async stdin reader
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut stdin_lines = stdin.lines();
+
+    // Prompt state
+    let mut needs_prompt = true;
+
+    loop {
+        if needs_prompt {
+            print!("\x1b[33m> \x1b[0m");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            needs_prompt = false;
+        }
+
+        tokio::select! {
+            // Messages from the agent via router
+            msg = ep.read_message() => {
+                match msg {
+                    Ok(RouterMessage::Incoming { from, content }) => {
+                        // Check for special prefixes
+                        if content.starts_with("[INPUT_REQUESTED:") {
+                            // Agent needs user input — show the prompt
+                            let prompt = content
+                                .strip_prefix("[INPUT_REQUESTED:")
+                                .unwrap_or(&content)
+                                .trim_end_matches(']');
+                            eprintln!();
+                            eprintln!("\x1b[36m  [{}] asks:\x1b[0m {}", &from[from.len()-4..], prompt);
+                            needs_prompt = true;
+                        } else if content.starts_with("[TOOL:") {
+                            // Tool call summary
+                            eprintln!("\x1b[90m  {}\x1b[0m", content);
+                            needs_prompt = true;
+                        } else if content.starts_with("[DONE]") {
+                            // Agent finished
+                            eprintln!();
+                            eprintln!("\x1b[32m  [{}] Task complete.\x1b[0m", short_id);
+                            break;
+                        } else if content.starts_with("[STARTED]") {
+                            eprintln!("\x1b[36m  [{}] Started working...\x1b[0m", short_id);
+                        } else {
+                            // Regular output — render with markdown formatting
+                            use std::io::Write;
+                            let mut buf = Vec::new();
+                            render::render_markdown(&mut buf, &content);
+                            let rendered = String::from_utf8_lossy(&buf);
+                            print!("{}", rendered);
+                            std::io::stdout().flush()?;
+                            if content.ends_with('\n') {
+                                needs_prompt = true;
+                            }
+                        }
+                    }
+                    Ok(RouterMessage::Stop { .. }) => {
+                        eprintln!("\n\x1b[31m  [{}] Stopped.\x1b[0m", short_id);
+                        break;
+                    }
+                    Ok(_) => {} // Ignore other messages
+                    Err(e) => {
+                        eprintln!("\n\x1b[31m  Connection lost: {}\x1b[0m", e);
+                        break;
+                    }
+                }
+            }
+
+            // User input from stdin
+            line = stdin_lines.next_line() => {
+                match line {
+                    Ok(Some(text)) => {
+                        if text.is_empty() {
+                            needs_prompt = true;
+                            continue;
+                        }
+                        // Send input to the agent via router
+                        if let Err(e) = ep.send_to(agent_id, &text).await {
+                            eprintln!("\n\x1b[31m  Send failed: {}\x1b[0m", e);
+                            break;
+                        }
+                        needs_prompt = true;
+                    }
+                    Ok(None) => break, // EOF
+                    Err(e) => {
+                        eprintln!("\n\x1b[31m  stdin error: {}\x1b[0m", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("\n\x1b[90m  Display client disconnected.\x1b[0m");
+    Ok(())
+}
+
+// ── Notification drain helpers ───────────────────────────────────────────
+
+/// Drain sub-agent completion notifications and display to user.
+/// Used between REPL turns (post-turn).
+fn drain_and_display_notifications(
+    notify_shared: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+) {
+    let notifications: Vec<flint_swarm::AgentNotification> = if let Some(ref rx) = notify_shared {
+        let mut rx = rx.lock().unwrap();
+        let mut notifs = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            notifs.push(n);
+        }
+        notifs
+    } else {
+        return;
+    };
+
+    for notif in &notifications {
+        let short_id = notif.agent_id.strip_prefix("agent_").unwrap_or(&notif.agent_id);
+        let short_id = &short_id[..4.min(short_id.len())];
+        let short_task = &notif.task_id[..8.min(notif.task_id.len())];
+        match &notif.result {
+            Ok(text) => {
+                let preview: String = text.chars().take(200).collect();
+                let truncated = if text.len() > 200 { "..." } else { "" };
+                eprintln!(
+                    "\x1b[36m  [swarm] Agent [{}] completed task {}:\x1b[0m",
+                    short_id, short_task
+                );
+                eprintln!("\x1b[36m  {}{}\x1b[0m", preview, truncated);
+                eprintln!(
+                    "\x1b[90m  Use 'swarm wait agent_id={}' or 'swarm result task_id={}' to get full result.\x1b[0m",
+                    notif.agent_id, notif.task_id
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "\x1b[31m  [swarm] Agent [{}] failed task {}: {}\x1b[0m",
+                    short_id, short_task, e
+                );
+            }
+        }
+    }
+
+    if let Some(ref sw) = swarm {
+        let mut sm = sw.lock().unwrap();
+        for notif in &notifications {
+            match &notif.result {
+                Ok(text) => sm.complete_task(&notif.task_id, text, true),
+                Err(e) => sm.complete_task(&notif.task_id, e, false),
+            }
+        }
+    }
+}
+
+/// Same as drain_and_display_notifications but usable inside a Fn callback
+/// (takes shared references that can be cloned into closures).
+fn drain_and_display_notifications_sync(
+    notify_shared: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+) {
+    drain_and_display_notifications(notify_shared, swarm);
+}
+
+/// Drain streaming output from interactive agents during run_turn callback.
+fn drain_and_display_streams_sync(
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+) {
+    if let Some(ref sw) = swarm {
+        let stream_chunks = {
+            let sm = sw.lock().unwrap();
+            sm.drain_all_streams()
+        };
+        for (agent_id, chunk) in &stream_chunks {
+            let short_id = agent_id.strip_prefix("agent_").unwrap_or(agent_id);
+            let short_id = &short_id[..4.min(short_id.len())];
+
+            if chunk.starts_with("[INPUT_REQUESTED:") {
+                // Input requests are handled by the REPL's input handler
+                // (read_line_with_handler), so skip here.
+            } else if chunk == "[DONE]" {
+                eprintln!("\x1b[32m  [{}] Done.\x1b[0m", short_id);
+            } else if chunk.starts_with("[TOOL:") {
+                eprintln!("\x1b[90m  {}\x1b[0m", chunk);
+            } else {
+                // Regular text — render with markdown
+                let mut buf = Vec::new();
+                render::render_markdown(&mut buf, chunk);
+                let rendered = String::from_utf8_lossy(&buf);
+                use std::io::Write;
+                print!("{}", rendered);
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+}
+
+// ── Sub-agent result delivery ───────────────────────────────────────────
+
+/// Deliver the sub-agent's final result to the coordinator via TCP Router.
+/// The coordinator's `swarm wait` polls the router's result channel to receive this.
+async fn deliver_sub_agent_result(
+    result: &str,
+    router_endpoint: &mut Option<flint_swarm::endpoint::AgentEndpoint>,
+    _working_dir: &Path,
+) {
+    let agent_id = std::env::var("FLINT_SUB_AGENT_ID").unwrap_or_default();
+    let task_id = std::env::var("FLINT_SUB_TASK_ID").unwrap_or_default();
+    if let Some(ep) = router_endpoint.as_mut() {
+        if !agent_id.is_empty() {
+            let msg = flint_swarm::router::RouterMessage::Result {
+                agent_id,
+                task_id,
+                result: result.to_string(),
+            };
+            let _ = ep.send_message(&msg).await;
         }
     }
 }

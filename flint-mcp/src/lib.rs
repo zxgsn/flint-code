@@ -7,10 +7,12 @@
 //! 4. **Dispatch** — registered in `ToolRegistry`, dispatched by `run_turn()` as usual
 
 pub mod client;
+pub mod http_client;
 pub mod manager;
 pub mod protocol;
 pub mod tool;
 
 pub use client::McpClient;
+pub use http_client::HttpMcpClient;
 pub use manager::{McpManager, McpServerConfig};
 pub use tool::McpTool;

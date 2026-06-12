@@ -488,6 +488,7 @@ dependencies = [
  "flint-mcp",
  "flint-memory",
  "flint-provider",
+ "flint-swarm",
  "flint-types",
  "glob",
  "ratatui",
@@ -521,6 +522,8 @@ dependencies = [
  "flint-agent",
  "flint-config",
  "flint-types",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -553,6 +556,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flint-swarm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "flint-agent",
+ "flint-provider",
+ "flint-types",
+ "futures",
+ "glob",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

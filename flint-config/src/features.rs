@@ -10,6 +10,7 @@ pub enum Feature {
     Memory,
     Compaction,
     Permissions,
+    Swarm,
 }
 
 // ── Per-feature config blocks ───────────────────────────────────────────────
@@ -53,6 +54,20 @@ pub struct PermissionConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmConfig {
+    pub enabled: bool,
+    /// Maximum number of concurrent sub-agents.
+    #[serde(default = "default_max_agents")]
+    pub max_agents: usize,
+    /// Max LLM turns per sub-agent task.
+    #[serde(default = "default_agent_max_turns")]
+    pub agent_max_turns: u32,
+    /// Task timeout in seconds.
+    #[serde(default = "default_task_timeout_secs")]
+    pub task_timeout_secs: u64,
+}
+
 // ── Aggregate feature container ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +76,8 @@ pub struct Features {
     pub memory: MemoryConfig,
     pub compaction: CompactionConfig,
     pub permissions: PermissionConfig,
+    #[serde(default)]
+    pub swarm: SwarmConfig,
 }
 
 impl Features {
@@ -71,6 +88,7 @@ impl Features {
             Feature::Memory => self.memory.enabled,
             Feature::Compaction => self.compaction.enabled,
             Feature::Permissions => self.permissions.enabled,
+            Feature::Swarm => self.swarm.enabled,
         }
     }
 }
@@ -91,6 +109,18 @@ fn default_max_block_chars() -> usize {
 
 fn default_search_limit() -> usize {
     5
+}
+
+fn default_max_agents() -> usize {
+    5
+}
+
+fn default_agent_max_turns() -> u32 {
+    20
+}
+
+fn default_task_timeout_secs() -> u64 {
+    300
 }
 
 // ── Defaults: everything ON ─────────────────────────────────────────────────
@@ -129,6 +159,17 @@ impl Default for PermissionConfig {
     }
 }
 
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // opt-in
+            max_agents: default_max_agents(),
+            agent_max_turns: default_agent_max_turns(),
+            task_timeout_secs: default_task_timeout_secs(),
+        }
+    }
+}
+
 impl Default for Features {
     fn default() -> Self {
         Self {
@@ -136,6 +177,7 @@ impl Default for Features {
             memory: MemoryConfig::default(),
             compaction: CompactionConfig::default(),
             permissions: PermissionConfig::default(),
+            swarm: SwarmConfig::default(),
         }
     }
 }

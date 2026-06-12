@@ -1,4 +1,6 @@
 //! Adapter that wraps an MCP tool as a flint Tool.
+//!
+//! Supports both stdio and HTTP/SSE transports.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -7,15 +9,40 @@ use flint_types::{ToolDefinition, ToolOutput};
 use std::sync::Arc;
 
 use crate::client::McpClient;
+use crate::http_client::HttpMcpClient;
 use crate::protocol::ToolInfo;
 
+/// Transport-specific client reference.
+enum TransportClient {
+    Stdio(Arc<McpClient>),
+    Http(Arc<HttpMcpClient>, String), // client + endpoint
+}
+
 /// Wraps an MCP server tool as a flint `Tool`.
-///
-/// When executed, it delegates to the MCP server via `tools/call`.
 pub struct McpTool {
     pub server_id: String,
     pub info: ToolInfo,
-    pub client: Arc<McpClient>,
+    transport: TransportClient,
+}
+
+impl McpTool {
+    /// Create a tool backed by a stdio MCP client.
+    pub fn new_stdio(server_id: &str, info: ToolInfo, client: Arc<McpClient>) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            info,
+            transport: TransportClient::Stdio(client),
+        }
+    }
+
+    /// Create a tool backed by an HTTP/SSE MCP client.
+    pub fn new_http(server_id: &str, info: ToolInfo, client: Arc<HttpMcpClient>, endpoint: String) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            info,
+            transport: TransportClient::Http(client, endpoint),
+        }
+    }
 }
 
 #[async_trait]
@@ -37,9 +64,17 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
-        match self.client.call_tool(&self.info.name, input).await {
+        let result = match &self.transport {
+            TransportClient::Stdio(client) => {
+                client.call_tool(&self.info.name, input).await
+            }
+            TransportClient::Http(client, endpoint) => {
+                client.call_tool(endpoint, &self.info.name, input).await
+            }
+        };
+
+        match result {
             Ok(result) => {
-                // Convert MCP content blocks to text
                 let text: String = result
                     .content
                     .iter()

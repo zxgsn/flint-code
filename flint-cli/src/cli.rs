@@ -14,6 +14,50 @@ pub struct Cli {
     /// Working directory
     #[arg(global = true, long, default_value = ".")]
     pub dir: String,
+
+    /// System prompt override (inline string)
+    #[arg(global = true, long)]
+    pub system: Option<String>,
+
+    /// System prompt from file (reads file content as system prompt)
+    #[arg(global = true, long)]
+    pub system_file: Option<String>,
+
+    /// Initial message to inject into session before REPL starts.
+    /// The agent processes this message immediately, then enters interactive mode.
+    #[arg(global = true, long)]
+    pub initial_message: Option<String>,
+
+    /// Initial message from file (reads file content as the initial message).
+    /// Useful for swarm sub-agents to avoid shell escaping issues.
+    #[arg(global = true, long)]
+    pub initial_message_file: Option<String>,
+
+    /// Message file for inter-agent communication.
+    /// The REPL checks this file for pending messages from the coordinator
+    /// before each turn. Messages are consumed (file is cleared) after reading.
+    #[arg(global = true, long)]
+    pub message_file: Option<String>,
+
+    /// Router address for real-time agent communication (127.0.0.1:port).
+    /// When set, the agent connects to the MessageRouter for instant message delivery.
+    #[arg(global = true, long)]
+    pub router_addr: Option<String>,
+
+    /// Agent ID (used by sub-agents to identify themselves to the router).
+    #[arg(global = true, long)]
+    pub agent_id: Option<String>,
+
+    /// Display client mode: connect to a swarm agent via router and act as
+    /// a thin terminal client (show agent output, forward user input).
+    /// Requires --router-addr and --agent-id.
+    #[arg(global = true, long)]
+    pub display: bool,
+
+    /// Path to a SpawnContext JSON file. When set, the agent loads context
+    /// from this file and runs as a sub-agent with inherited context.
+    #[arg(global = true, long)]
+    pub spawn_context: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -58,4 +102,24 @@ pub struct AgentArgs {
     /// System prompt
     #[arg(long)]
     pub system: Option<String>,
+
+    /// Initial message to inject into session before REPL starts.
+    #[arg(long)]
+    pub initial_message: Option<String>,
+
+    /// Message file for inter-agent communication.
+    #[arg(long)]
+    pub message_file: Option<String>,
+
+    /// Router address for real-time agent communication.
+    #[arg(long)]
+    pub router_addr: Option<String>,
+
+    /// Agent ID (used by sub-agents to identify themselves to the router).
+    #[arg(long)]
+    pub agent_id: Option<String>,
+
+    /// Path to SpawnContext JSON (loaded by sub-agents spawned in new terminals).
+    #[arg(long)]
+    pub spawn_context: Option<String>,
 }

@@ -155,6 +155,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Compress history"),
     ("/clear", "Clear session"),
     ("/status", "Show status"),
+    ("/swarm", "Swarm status / spawn terminal agent"),
     ("/help", "Show help"),
     ("/quit", "Exit"),
 ];
@@ -233,7 +234,18 @@ fn get_path_completions(partial: &str, working_dir: &std::path::Path) -> Vec<Str
 /// Read a line from the terminal using crossterm raw mode.
 pub fn read_line() -> Result<InputResult> {
     enable_raw_mode()?;
-    let result = read_line_inner();
+    let result = read_line_inner(|| {});
+    disable_raw_mode()?;
+    println!();
+    result
+}
+
+/// Read a line with a periodic handler that runs during poll timeouts.
+/// The handler is called every ~100ms while waiting for user input.
+/// This allows processing input requests from sub-agents without blocking.
+pub fn read_line_with_handler<F: FnMut()>(handler: F) -> Result<InputResult> {
+    enable_raw_mode()?;
+    let result = read_line_inner(handler);
     disable_raw_mode()?;
     println!();
     result
@@ -241,7 +253,7 @@ pub fn read_line() -> Result<InputResult> {
 
 // ── Core input loop ────────────────────────────────────────────────────────
 
-fn read_line_inner() -> Result<InputResult> {
+fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
     let mut buf = String::new();
     let mut cursor_pos: usize = 0;
     let mut ctrl_c_count: u8 = 0;
@@ -257,6 +269,13 @@ fn read_line_inner() -> Result<InputResult> {
     let (_, mut start_row) = crossterm::cursor::position()?;
 
     loop {
+        // Poll with 100ms timeout instead of blocking event::read().
+        // This lets us run the handler periodically to process input requests.
+        if !event::poll(std::time::Duration::from_millis(100))? {
+            // No event — run the handler
+            handler();
+            continue;
+        }
         if let Event::Key(KeyEvent {
             code, modifiers, kind, ..
         }) = event::read()?
@@ -389,6 +408,7 @@ fn read_line_inner() -> Result<InputResult> {
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Delete
                 (KeyCode::Delete, _) => {
@@ -401,18 +421,21 @@ fn read_line_inner() -> Result<InputResult> {
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+A — move to beginning of line
                 (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                     cursor_pos = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+E — move to end of line
                 (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                     cursor_pos = buf.len();
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+U — delete to beginning of line
                 (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -422,6 +445,7 @@ fn read_line_inner() -> Result<InputResult> {
                     tab_index = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+K — delete to end of line
                 (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
@@ -430,6 +454,7 @@ fn read_line_inner() -> Result<InputResult> {
                     tab_index = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+W — delete previous word
                 (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
@@ -445,6 +470,7 @@ fn read_line_inner() -> Result<InputResult> {
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+L — clear screen
                 (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
@@ -455,6 +481,7 @@ fn read_line_inner() -> Result<InputResult> {
                     start_row = 0;
                     render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Ctrl+Z — undo
                 (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
@@ -465,6 +492,7 @@ fn read_line_inner() -> Result<InputResult> {
                         render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
                     }
                     ctrl_c_count = 0;
+                    rapid_char_count = 0;
                 }
                 // Regular character
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {

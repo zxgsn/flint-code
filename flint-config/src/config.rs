@@ -58,7 +58,8 @@ pub struct LoggingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Command to spawn the MCP server process.
+    /// Command to spawn the MCP server process (for stdio transport).
+    #[serde(default)]
     pub command: String,
     /// Arguments to pass to the command.
     #[serde(default)]
@@ -66,6 +67,10 @@ pub struct McpServerConfig {
     /// Environment variables for the server process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// URL for HTTP/SSE transport (e.g., "http://localhost:3000/sse").
+    /// If set, uses HTTP instead of stdio.
+    #[serde(default)]
+    pub url: String,
 }
 
 // ── Top-level config ────────────────────────────────────────────────────────

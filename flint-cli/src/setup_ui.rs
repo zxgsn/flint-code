@@ -97,6 +97,20 @@ impl SetupApp {
         }
     }
 
+    /// Create a setup app that jumps directly to editing the current provider.
+    fn new_editing() -> Self {
+        let mut app = Self::new();
+        // Detect current provider from environment
+        let current_provider = std::env::var("FLINT_PROVIDER").unwrap_or_default();
+        let idx = PROVIDERS
+            .iter()
+            .position(|p| p.name == current_provider)
+            .unwrap_or(0);
+        app.list_state.select(Some(idx));
+        app.select_provider(idx);
+        app
+    }
+
     fn select_provider(&mut self, idx: usize) {
         let p = &PROVIDERS[idx];
         // Pre-populate from current environment variables
@@ -380,13 +394,22 @@ pub(super) fn find_provider(name: &str) -> Option<&'static ProviderDef> {
 
 /// Run the setup wizard. Returns `Ok(true)` if a provider was configured.
 pub fn run(env_path: &Path) -> Result<bool> {
+    run_with_app(SetupApp::new(), env_path)
+}
+
+/// Run the setup wizard in edit mode — jumps directly to the current
+/// provider's credential form with existing values pre-filled.
+pub fn run_edit(env_path: &Path) -> Result<bool> {
+    run_with_app(SetupApp::new_editing(), env_path)
+}
+
+fn run_with_app(mut app: SetupApp, env_path: &Path) -> Result<bool> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = SetupApp::new();
     let result = run_loop(&mut terminal, &mut app, env_path);
 
     disable_raw_mode()?;
