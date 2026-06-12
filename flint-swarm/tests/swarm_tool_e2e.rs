@@ -400,7 +400,7 @@ async fn test_full_coordinator_flow_with_run_turn() {
 
     let result = run_turn(
         provider.as_ref(), &mut session, &registry, system, &ctx,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await;
 
     let (text, _stats) = result.unwrap();

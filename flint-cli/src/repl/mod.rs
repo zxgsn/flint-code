@@ -140,6 +140,9 @@ pub async fn run(
         cancel.store(false, Ordering::Relaxed);
 
         let effective_system = system.to_string();
+        let render_line = |line: &str| {
+            crate::repl::render::render_markdown_line_to_stdout(line);
+        };
         match run_turn(
             prov.as_ref(),
             &mut session,
@@ -151,6 +154,7 @@ pub async fn run(
             config.agent.max_output_chars,
             false,
             None,
+            Some(&render_line),
         )
         .await
         {
@@ -223,10 +227,13 @@ pub async fn run(
             turn_count += 1;
             turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
             let effective_system = system.to_string();
+            let render_line = |line: &str| {
+                crate::repl::render::render_markdown_line_to_stdout(line);
+            };
             match run_turn(
                 prov.as_ref(), &mut session, &registry, &effective_system, ctx,
                 config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
-                false, None,
+                false, None, Some(&render_line),
             ).await {
                 Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
                 Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
@@ -358,10 +365,13 @@ pub async fn run(
                 turn_count += 1;
                 turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
                 let effective_system = system.to_string();
+                let render_line = |line: &str| {
+                    crate::repl::render::render_markdown_line_to_stdout(line);
+                };
                 match run_turn(
                     prov.as_ref(), &mut session, &registry, &effective_system, ctx,
                     config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
-                    false, None,
+                    false, None, Some(&render_line),
                 ).await {
                     Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
                     Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
@@ -463,6 +473,9 @@ pub async fn run(
             true
         });
 
+        let render_line = |line: &str| {
+            crate::repl::render::render_markdown_line_to_stdout(line);
+        };
         match run_turn(
             prov.as_ref(),
             &mut session,
@@ -474,6 +487,7 @@ pub async fn run(
             config.agent.max_output_chars,
             false,
             Some(&turn_callback),
+            Some(&render_line),
         )
         .await
         {
@@ -547,6 +561,7 @@ pub async fn run(
                         config.agent.max_output_chars,
                         false,
                         Some(&turn_callback),
+                        Some(&render_line),
                     )
                     .await
                     {
@@ -718,6 +733,7 @@ async fn dispatch_auto_compact(
         65536,
         true, // silent
         None,
+        None,
     )
     .await
     {
@@ -807,6 +823,7 @@ async fn auto_extract_memories(
         None,
         65536,
         true, // silent
+        None,
         None,
     )
     .await

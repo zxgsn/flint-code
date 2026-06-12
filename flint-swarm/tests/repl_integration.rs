@@ -117,7 +117,7 @@ async fn test_repl_turn_spawn() {
 
     let (text, stats) = run_turn(
         coordinator_provider.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
 
     // LLM should have processed the tool result and responded
@@ -167,7 +167,7 @@ async fn test_repl_multi_turn_spawn_wait_followup() {
 
     let (text1, _) = run_turn(
         coordinator_turn1.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
     assert!(text1.contains("Spawned agent") || text1.contains("bugs"), "turn 1: {}", text1);
 
@@ -199,7 +199,7 @@ async fn test_repl_multi_turn_spawn_wait_followup() {
     session.add_user("what did the agent find?");
     let (text2, stats2) = run_turn(
         coordinator_turn2.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
     assert!(stats2.tool_calls >= 1, "turn 2 should call wait");
     assert!(
@@ -220,7 +220,7 @@ async fn test_repl_multi_turn_spawn_wait_followup() {
     session.add_user("tell me more about bug1");
     let (text3, stats3) = run_turn(
         coordinator_turn3.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
     assert!(stats3.tool_calls >= 1, "turn 3 should call followup");
     assert!(
@@ -256,7 +256,7 @@ async fn test_repl_initial_message_flow() {
 
     let (text, stats) = run_turn(
         coordinator_provider.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
 
     // The agent should have processed the initial message
@@ -288,15 +288,15 @@ async fn test_repl_session_accumulates() {
 
     // Turn 1
     session.add_user("hello");
-    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None).await.unwrap();
+    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None, None).await.unwrap();
 
     // Turn 2
     session.add_user("remember: X is important");
-    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None).await.unwrap();
+    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None, None).await.unwrap();
 
     // Turn 3
     session.add_user("what did I say about X?");
-    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None).await.unwrap();
+    run_turn(provider.as_ref(), &mut session, &registry, system, &c, 10, None, 65536, true, None, None).await.unwrap();
 
     // Session should have accumulated all messages
     // Each turn adds: user + assistant = 2 messages per turn
@@ -339,7 +339,7 @@ async fn test_repl_parallel_spawn_one_turn() {
 
     let (text, stats) = run_turn(
         coordinator.as_ref(), &mut session, &registry, system, &c,
-        10, None, 65536, true, None,
+        10, None, 65536, true, None, None,
     ).await.unwrap();
 
     assert!(stats.tool_calls >= 2, "should call spawn twice, got {}", stats.tool_calls);

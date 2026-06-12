@@ -116,6 +116,7 @@ pub async fn run_turn(
     max_output_chars: usize,
     silent: bool,
     callback: Option<&crate::EventCallback>,
+    render_fn: Option<&dyn Fn(&str)>,
 ) -> Result<(String, TurnStats)> {
     let turn_start = Instant::now();
     let mut turn_iter = 0u32;
@@ -167,6 +168,8 @@ pub async fn run_turn(
         let mut tool_calls = Vec::new();
         let mut first_delta = true;
         let mut token_count: usize = 0;
+        // Line buffer for streaming markdown rendering
+        let mut line_buffer = String::new();
 
         while let Some(event) = stream.next().await {
             match event? {
@@ -191,7 +194,18 @@ pub async fn run_turn(
                         if !cb(&crate::AgentEvent::TextDelta(t.clone())) { print_text = false; }
                     }
                     if print_text {
-                        print!("{}", t);
+                        // Buffer text and render complete lines
+                        line_buffer.push_str(&t);
+                        while let Some(newline_pos) = line_buffer.find('\n') {
+                            let line = &line_buffer[..newline_pos];
+                            if let Some(ref render_fn) = render_fn {
+                                render_fn(line);
+                                println!();
+                            } else {
+                                println!("{}", line);
+                            }
+                            line_buffer = line_buffer[newline_pos + 1..].to_string();
+                        }
                     }
                 }
                 StreamEvent::ToolCall(tc) => {
@@ -213,6 +227,16 @@ pub async fn run_turn(
                 StreamEvent::End => break,
                 StreamEvent::Raw(_) => {}
             }
+        }
+
+        // Flush remaining line buffer
+        if !silent && !line_buffer.is_empty() {
+            if let Some(ref render_fn) = render_fn {
+                render_fn(&line_buffer);
+            } else {
+                print!("{}", line_buffer);
+            }
+            line_buffer.clear();
         }
 
         // No tool calls → turn is done
@@ -277,7 +301,7 @@ pub async fn run_turn(
 
             // Display tool call previews
             for tc in tool_calls.iter() {
-                print!("  {} {}", yellow("*"), bold(&tc.name));
+                print!("  {} {}", dim("*"), dim(&tc.name));
                 if let Some(input_str) = tc.input.as_str() {
                     let preview: String = input_str.chars().take(80).collect();
                     if !preview.is_empty() {
@@ -372,9 +396,9 @@ pub async fn run_turn(
             }
             if print_result {
                 if output.is_error {
-                    println!("  {} {} {}", red("x"), preview, dim(&format!("({})", format_elapsed(tool_elapsed))));
+                    println!("  {} {} {}", red("x"), dim(&preview), dim(&format!("({})", format_elapsed(tool_elapsed))));
                 } else {
-                    println!("  {} {}{} {}", green("+"), preview, truncated, dim(&format!("({})", format_elapsed(tool_elapsed))));
+                    println!("  {} {}{} {}", dim("+"), dim(&preview), dim(truncated), dim(&format!("({})", format_elapsed(tool_elapsed))));
                 }
             }
             session.add_tool_result(&tool_calls[i].id, &output);

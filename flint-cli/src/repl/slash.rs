@@ -319,6 +319,7 @@ async fn dispatch_compact(sc: &mut SlashContext<'_>) -> Result<()> {
         65536,
         true, // silent
         None,
+        None,
     )
     .await
     {

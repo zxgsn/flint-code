@@ -70,13 +70,13 @@ pub fn render_markdown<W: Write>(out: &mut W, text: &str) {
         // ── Headers ────────────────────────────────────────────────────
         if let Some(level) = header_level(line) {
             let content = line.trim_start().trim_start_matches('#').trim();
-            let (color, prefix) = match level {
-                1 => (fg_yellow(), "█ "),
-                2 => (fg_cyan(), "▓ "),
-                3 => (fg_blue(), "▒ "),
-                _ => (fg_magenta(), "░ "),
+            let color = match level {
+                1 => fg_yellow(),
+                2 => fg_cyan(),
+                3 => fg_blue(),
+                _ => fg_magenta(),
             };
-            writeln!(out, "{}{}{}{} {}{}", color, bold(), prefix, content, reset(), reset()).ok();
+            writeln!(out, "{}{}{}{}", color, bold(), content, reset()).ok();
             i += 1;
             continue;
         }
@@ -138,6 +138,53 @@ pub fn render_markdown<W: Write>(out: &mut W, text: &str) {
 /// Render a single line to a string (for use in other contexts).
 pub fn render_markdown_line(text: &str) -> String {
     render_inline(text)
+}
+
+/// Render a single line with markdown formatting and print to stdout.
+/// Used for streaming output where lines are rendered incrementally.
+pub fn render_markdown_line_to_stdout(line: &str) {
+    // Handle headers
+    if let Some(level) = header_level(line) {
+        let content = line.trim_start().trim_start_matches('#').trim();
+        let color = match level {
+            1 => fg_yellow(),
+            2 => fg_cyan(),
+            3 => fg_blue(),
+            _ => fg_magenta(),
+        };
+        print!("{}{}{}{}", color, bold(), content, reset());
+        return;
+    }
+
+    // Handle code block lines (simple check for ``` fences)
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        print!("{}{}{} ", fg_gray(), dim(), line);
+        print!("{}", reset());
+        return;
+    }
+
+    // Handle list items
+    if let Some(content) = parse_list_item(line) {
+        print!("  {}•{} {}", fg_cyan(), reset(), render_inline(content));
+        return;
+    }
+
+    // Handle ordered list items
+    if let Some((num, content)) = parse_ordered_list_item(line) {
+        print!("  {}{}{}.{} {}", fg_cyan(), num, ".", reset(), render_inline(content));
+        return;
+    }
+
+    // Handle blockquotes
+    if trimmed.starts_with('>') {
+        let content = trimmed.trim_start_matches('>').trim();
+        print!("{}  │ {}{}{}", dim(), fg_gray(), render_inline(content), reset());
+        return;
+    }
+
+    // Regular text with inline formatting
+    print!("{}", render_inline(line));
 }
 
 // ── Inline rendering ───────────────────────────────────────────────────

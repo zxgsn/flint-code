@@ -412,6 +412,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         // One-shot mode
         let mut session = Session::new();
         session.add_user(prompt);
+        let render_line = |line: &str| {
+            crate::repl::render::render_markdown_line_to_stdout(line);
+        };
         if let Err(e) = flint_agent::run_turn(
             prov_arc.as_ref(),
             &mut session,
@@ -423,6 +426,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             config.agent.max_output_chars,
             false,
             None,
+            Some(&render_line),
         )
         .await
         {
