@@ -2,10 +2,12 @@
 
 pub mod agent;
 pub mod session;
+pub mod todo;
 pub mod tool;
 
 pub use agent::{run_turn, TurnStats};
 pub use session::{Session, SessionMeta};
+pub use todo::TodoStore;
 pub use tool::{Tool, ToolContext, ToolRegistry};
 
 /// Structured event emitted during `run_turn` for real-time observation.

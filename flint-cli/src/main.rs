@@ -211,6 +211,16 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     let mut registry = ToolRegistry::new();
     tools::register_builtins(&mut registry);
 
+    // Auto-poke hint in system prompt (only for main agents, not sub-agents)
+    if args.spawn_context.is_none() {
+        system.push_str("\n\n## Todo Tool\n\
+            You have a `todo` tool for tracking multi-step tasks. \
+            When given a complex request, break it into todos and track progress. \
+            After each turn with incomplete todos, you will receive an automatic \
+            \"continue working\" prompt. Use `todo update` to mark items as completed \
+            or cancelled as you finish them.");
+    }
+
     // Initialize memory system (if enabled)
     let memory: Option<Arc<Mutex<flint_memory::MemoryManager>>> =
         if config.features.is_enabled(Feature::Memory) {
@@ -238,6 +248,15 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         } else {
             None
         };
+
+    // Initialize todo system and auto-poke (main agent only, not sub-agents)
+    let todo_store = flint_agent::todo::new_store();
+    let auto_poke = if args.spawn_context.is_none() {
+        tools::register_todo_tool(&mut registry, todo_store.clone());
+        Some(crate::repl::auto_poke::AutoPoke::new(todo_store))
+    } else {
+        None
+    };
 
     // Connect MCP servers (only enabled ones)
     let enabled_mcp: std::collections::HashMap<_, _> = config.mcp_servers.iter()
@@ -434,6 +453,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             memory,
             swarm,
             swarm_notify,
+            auto_poke,
             args.initial_message.clone(),
             args.message_file.clone(),
             args.router_addr.clone(),

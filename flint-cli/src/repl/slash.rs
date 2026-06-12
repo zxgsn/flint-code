@@ -26,6 +26,7 @@ pub enum SlashAction {
     Memory(Option<String>),
     Resume(Option<String>),
     Swarm(Option<String>),
+    Poke(Option<String>),
     Quit,
     Unknown(String),
 }
@@ -66,6 +67,10 @@ pub fn parse(input: &str) -> Option<SlashAction> {
             let arg = input[1..].split_whitespace().nth(1);
             SlashAction::Swarm(arg.map(|s| s.to_string()))
         }
+        "poke" => {
+            let arg = input[1..].split_whitespace().nth(1);
+            SlashAction::Poke(arg.map(|s| s.to_string()))
+        }
         "quit" | "exit" | "q" => SlashAction::Quit,
         other => SlashAction::Unknown(other.to_string()),
     })
@@ -84,6 +89,7 @@ pub struct SlashContext<'a> {
     pub working_dir: &'a Path,
     pub memory: &'a mut Option<Arc<Mutex<flint_memory::MemoryManager>>>,
     pub swarm: &'a mut Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    pub auto_poke: &'a mut Option<crate::repl::auto_poke::AutoPoke>,
     pub system: &'a str,
     pub turn_count: u32,
     pub total_tool_calls: u32,
@@ -251,6 +257,9 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
         }
         SlashAction::Swarm(sub) => {
             dispatch_swarm(sub, sc);
+        }
+        SlashAction::Poke(sub) => {
+            dispatch_poke(sub, sc);
         }
         SlashAction::Unknown(cmd) => {
             println!(
@@ -724,6 +733,65 @@ Logs are saved to ~/.flint/swarm-logs/\n"
                 sm.active_agent_count(),
                 tasks.len()
             );
+        }
+    }
+}
+
+fn dispatch_poke(sub: Option<String>, sc: &mut SlashContext<'_>) {
+    let ap = match sc.auto_poke {
+        Some(ref mut ap) => ap,
+        None => {
+            println!("Auto-poke is not available (todo tool not registered).\n");
+            return;
+        }
+    };
+
+    match sub.as_deref() {
+        Some("on") | Some("enable") => {
+            ap.enabled = true;
+            ap.consecutive_pokes = 0;
+            println!("Auto-poke: enabled (max {} consecutive pokes)\n", ap.max_pokes);
+        }
+        Some("off") | Some("disable") => {
+            ap.enabled = false;
+            println!("Auto-poke: disabled\n");
+        }
+        Some("status") => {
+            let incomplete = flint_agent::todo::incomplete_count(&ap.store);
+            println!(
+                "Auto-poke: {} | Pokes this round: {}/{} | Incomplete todos: {}\n",
+                if ap.enabled { "enabled" } else { "disabled" },
+                ap.consecutive_pokes,
+                ap.max_pokes,
+                incomplete,
+            );
+        }
+        Some("help") => {
+            println!(
+                "\
+Auto-poke automatically sends a \"continue working\" message when
+incomplete todos remain after a turn completes.
+
+Commands:
+  /poke on       Enable auto-poke
+  /poke off      Disable auto-poke
+  /poke status   Show current state
+  /poke help     Show this help
+
+Safety: stops after {} consecutive pokes without user input,
+and stops immediately on non-retryable errors (auth, billing, etc.).\n",
+                ap.max_pokes
+            );
+        }
+        _ => {
+            // Toggle
+            ap.enabled = !ap.enabled;
+            if ap.enabled {
+                ap.consecutive_pokes = 0;
+                println!("Auto-poke: enabled\n");
+            } else {
+                println!("Auto-poke: disabled\n");
+            }
         }
     }
 }

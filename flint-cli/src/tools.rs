@@ -695,6 +695,115 @@ impl Tool for MemoryUpdateCoreTool {
     }
 }
 
+// ── Todo ─────────────────────────────────────────────────────────────────────
+
+pub struct TodoTool {
+    pub store: flint_agent::TodoStore,
+}
+
+#[async_trait]
+impl Tool for TodoTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "todo".into(),
+            description: "Manage a session-scoped task list. Use this to track \
+                multi-step work. Actions: add, update, list. \
+                The auto-poke system will prompt you to continue when incomplete \
+                todos remain after a turn."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "update", "list"],
+                        "description": "add: create a new todo. update: change status. list: show all."
+                    },
+                    "title": { "type": "string", "description": "Todo title (for add)" },
+                    "id": { "type": "integer", "description": "Todo ID (for update)" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "cancelled"],
+                        "description": "New status (for update)"
+                    }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let action = input["action"].as_str().unwrap_or("list");
+
+        match action {
+            "add" => {
+                let title = match input["title"].as_str() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => return Ok(ToolOutput::error("missing 'title' for add")),
+                };
+                let mut todos = self.store.lock().unwrap();
+                let id = todos.len() as u32 + 1;
+                todos.push(flint_agent::todo::TodoItem {
+                    id,
+                    title: title.clone(),
+                    status: flint_agent::todo::TodoStatus::Pending,
+                });
+                Ok(ToolOutput::text(format!("Added todo #{}: {}", id, title)))
+            }
+            "update" => {
+                let id = match input["id"].as_u64() {
+                    Some(i) => i as u32,
+                    None => return Ok(ToolOutput::error("missing 'id' for update")),
+                };
+                let status_str = match input["status"].as_str() {
+                    Some(s) => s,
+                    None => return Ok(ToolOutput::error("missing 'status' for update")),
+                };
+                let status = match status_str {
+                    "pending" => flint_agent::todo::TodoStatus::Pending,
+                    "in_progress" => flint_agent::todo::TodoStatus::InProgress,
+                    "completed" => flint_agent::todo::TodoStatus::Completed,
+                    "cancelled" => flint_agent::todo::TodoStatus::Cancelled,
+                    _ => return Ok(ToolOutput::error(format!(
+                        "invalid status '{}', use: pending, in_progress, completed, cancelled",
+                        status_str
+                    ))),
+                };
+                let mut todos = self.store.lock().unwrap();
+                if let Some(item) = todos.iter_mut().find(|t| t.id == id) {
+                    let old = item.status.clone();
+                    item.status = status.clone();
+                    Ok(ToolOutput::text(format!(
+                        "Todo #{} '{}': {:?} → {:?}",
+                        id, item.title, old, status
+                    )))
+                } else {
+                    Ok(ToolOutput::error(format!("todo #{} not found", id)))
+                }
+            }
+            "list" | _ => {
+                let todos = self.store.lock().unwrap();
+                if todos.is_empty() {
+                    return Ok(ToolOutput::text("No todos.".to_string()));
+                }
+                let lines: Vec<String> = todos
+                    .iter()
+                    .map(|t| {
+                        let status_icon = match t.status {
+                            flint_agent::todo::TodoStatus::Pending => "[ ]",
+                            flint_agent::todo::TodoStatus::InProgress => "[~]",
+                            flint_agent::todo::TodoStatus::Completed => "[x]",
+                            flint_agent::todo::TodoStatus::Cancelled => "[-]",
+                        };
+                        format!("{} #{} {}", status_icon, t.id, t.title)
+                    })
+                    .collect();
+                Ok(ToolOutput::text(lines.join("\n")))
+            }
+        }
+    }
+}
+
 // ── Registration helper ────────────────────────────────────────────────────
 
 /// Register all built-in tools into the registry.
@@ -725,4 +834,9 @@ pub fn register_memory_tools(registry: &mut ToolRegistry, memory: SharedMemory) 
     registry.register(MemoryUpdateCoreTool {
         memory,
     });
+}
+
+/// Register the todo tool (when auto-poke is enabled).
+pub fn register_todo_tool(registry: &mut ToolRegistry, store: flint_agent::TodoStore) {
+    registry.register(TodoTool { store });
 }

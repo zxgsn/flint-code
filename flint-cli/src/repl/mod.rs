@@ -1,5 +1,6 @@
 //! REPL loop: input reading, command dispatch, LLM interaction, session management.
 
+pub mod auto_poke;
 pub mod render;
 pub mod shell;
 pub mod slash;
@@ -30,6 +31,7 @@ pub async fn run(
     mut memory: Option<Arc<Mutex<flint_memory::MemoryManager>>>,
     mut swarm: Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
     swarm_notify: Option<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>,
+    mut auto_poke: Option<auto_poke::AutoPoke>,
     initial_message: Option<String>,
     message_file: Option<String>,
     router_addr: Option<String>,
@@ -67,6 +69,10 @@ pub async fn run(
             "Swarm: enabled (max {} agents) -- /swarm to manage",
             sm.config().max_agents
         );
+    }
+
+    if auto_poke.is_some() {
+        println!("Auto-poke: enabled (todo tool active) -- /poke to toggle");
     }
 
     println!();
@@ -392,6 +398,7 @@ pub async fn run(
                 working_dir,
                 memory: &mut memory,
                 swarm: &mut swarm,
+                auto_poke: &mut auto_poke,
                 system,
                 turn_count,
                 total_tool_calls,
@@ -409,6 +416,11 @@ pub async fn run(
         // Normal message -> send to LLM
         turn_count += 1;
         eprintln!("\x1b[34m{}>\x1b[0m {}", turn_count, input);
+
+        // Reset auto-poke counter on user input
+        if let Some(ref mut ap) = auto_poke {
+            ap.reset_counter();
+        }
 
         let mut effective_system =
             if let Some(skill) = prompt::match_skill(&input, &config, working_dir) {
@@ -490,10 +502,65 @@ pub async fn run(
                         eprintln!("\x1b[90m  Waiting for follow-up tasks...\x1b[0m");
                     }
                 }
+
+                // ── Auto-poke: keep going if incomplete todos remain ──────
+                // This loop continues until: all todos complete, max pokes
+                // reached, a non-retryable error occurs, or the turn fails.
+                loop {
+                    let poke_msg = match auto_poke {
+                        Some(ref mut ap) => ap.should_poke(),
+                        None => break,
+                    };
+                    let poke_msg = match poke_msg {
+                        Some(m) => m,
+                        None => break,
+                    };
+
+                    turn_count += 1;
+                    eprintln!(
+                        "\x1b[33m  [auto-poke {}/{}]\x1b[0m {}",
+                        auto_poke.as_ref().map(|a| a.consecutive_pokes).unwrap_or(0),
+                        auto_poke.as_ref().map(|a| a.max_pokes).unwrap_or(10),
+                        poke_msg
+                    );
+
+                    session.add_user(&poke_msg);
+
+                    match run_turn(
+                        prov.as_ref(),
+                        &mut session,
+                        &registry,
+                        &effective_system,
+                        ctx,
+                        config.agent.max_turns,
+                        Some(cancel.clone()),
+                        config.agent.max_output_chars,
+                        false,
+                        Some(&turn_callback),
+                    )
+                    .await
+                    {
+                        Ok((_poke_text, poke_stats)) => {
+                            total_tool_calls += poke_stats.tool_calls;
+                            // Continue loop — check if more pokes needed
+                        }
+                        Err(e) => {
+                            eprintln!("\n\x1b[31m! Error during auto-poke:\x1b[0m {}", e);
+                            if let Some(ref mut ap) = auto_poke {
+                                ap.stop_for_error(&e.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e);
                 eprintln!("  Type /setup to reconfigure provider, or /model to switch model.\n");
+                // Stop auto-poke on non-retryable errors
+                if let Some(ref mut ap) = auto_poke {
+                    ap.stop_for_error(&e.to_string());
+                }
             }
         }
 

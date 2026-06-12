@@ -19,6 +19,8 @@ Built-in commands:
   /resume       List saved sessions (flint + Claude Code)
   /resume <id>  Restore a saved session
   /compact      Compress conversation history
+  /poke         Toggle auto-poke (auto-continue when todos remain)
+  /poke on/off  Enable or disable auto-poke
   /clear        Clear conversation history
   /status       Show current config status
   /help         Show this help message
