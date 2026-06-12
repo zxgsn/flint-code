@@ -64,6 +64,8 @@ impl RetryProvider {
             || msg.contains("connection")
             || msg.contains("eof")
             || msg.contains("broken pipe")
+            || msg.contains("decode")
+            || msg.contains("error decoding response body")
         {
             return true;
         }

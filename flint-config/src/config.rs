@@ -58,6 +58,9 @@ pub struct LoggingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Whether this MCP server is enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Command to spawn the MCP server process (for stdio transport).
     #[serde(default)]
     pub command: String,

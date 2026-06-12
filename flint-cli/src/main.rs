@@ -239,11 +239,15 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             None
         };
 
-    // Connect MCP servers
+    // Connect MCP servers (only enabled ones)
+    let enabled_mcp: std::collections::HashMap<_, _> = config.mcp_servers.iter()
+        .filter(|(_, cfg)| cfg.enabled)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let mut mcp_manager = McpManager::new();
-    if !config.mcp_servers.is_empty() {
-        eprintln!("Connecting to {} MCP server(s)...", config.mcp_servers.len());
-        match mcp_manager.connect_all(&config.mcp_servers).await {
+    if !enabled_mcp.is_empty() {
+        eprintln!("Connecting to {} MCP server(s)...", enabled_mcp.len());
+        match mcp_manager.connect_all(&enabled_mcp).await {
             Ok(mcp_tools) => {
                 let count = mcp_tools.len();
                 for tool in mcp_tools {
