@@ -305,7 +305,9 @@ pub async fn run_sub_agent(
 
                     // No tool calls → turn is done
                     if tool_calls.is_empty() {
-                        session.add_assistant(&text);
+                        if !text.is_empty() {
+                            session.add_assistant(&text);
+                        }
                         final_text = text;
                         break;
                     }

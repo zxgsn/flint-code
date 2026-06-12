@@ -217,7 +217,9 @@ pub async fn run_turn(
 
         // No tool calls → turn is done
         if tool_calls.is_empty() {
-            session.add_assistant(&text);
+            if !text.is_empty() {
+                session.add_assistant(&text);
+            }
             stats.llm_calls = turn_iter;
             stats.total_chars = token_count;
             let total_elapsed = turn_start.elapsed();
