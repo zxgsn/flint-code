@@ -209,7 +209,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     }
 
     let mut registry = ToolRegistry::new();
-    tools::register_builtins(&mut registry);
+    let checkpoint_store = flint_agent::checkpoint::new_store();
+    let turn_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    tools::register_builtins(&mut registry, checkpoint_store.clone(), turn_counter.clone());
 
     // Auto-poke hint in system prompt (only for main agents, not sub-agents)
     if args.spawn_context.is_none() {
@@ -456,6 +458,8 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             swarm,
             swarm_notify,
             auto_poke,
+            checkpoint_store,
+            turn_counter,
             args.initial_message.clone(),
             args.message_file.clone(),
             args.router_addr.clone(),

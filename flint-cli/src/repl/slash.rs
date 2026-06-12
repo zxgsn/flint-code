@@ -27,6 +27,7 @@ pub enum SlashAction {
     Resume(Option<String>),
     Swarm(Option<String>),
     Poke(Option<String>),
+    Undo,
     Quit,
     Unknown(String),
 }
@@ -71,6 +72,7 @@ pub fn parse(input: &str) -> Option<SlashAction> {
             let arg = input[1..].split_whitespace().nth(1);
             SlashAction::Poke(arg.map(|s| s.to_string()))
         }
+        "undo" => SlashAction::Undo,
         "quit" | "exit" | "q" => SlashAction::Quit,
         other => SlashAction::Unknown(other.to_string()),
     })
@@ -90,6 +92,8 @@ pub struct SlashContext<'a> {
     pub memory: &'a mut Option<Arc<Mutex<flint_memory::MemoryManager>>>,
     pub swarm: &'a mut Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
     pub auto_poke: &'a mut Option<crate::repl::auto_poke::AutoPoke>,
+    pub checkpoint_store: flint_agent::CheckpointStore,
+    pub turn_counter: Arc<std::sync::atomic::AtomicU32>,
     pub system: &'a str,
     pub turn_count: u32,
     pub total_tool_calls: u32,
@@ -260,6 +264,9 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
         }
         SlashAction::Poke(sub) => {
             dispatch_poke(sub, sc);
+        }
+        SlashAction::Undo => {
+            dispatch_undo(sc);
         }
         SlashAction::Unknown(cmd) => {
             println!(
@@ -793,5 +800,62 @@ and stops immediately on non-retryable errors (auth, billing, etc.).\n",
                 println!("Auto-poke: disabled\n");
             }
         }
+    }
+}
+
+fn dispatch_undo(sc: &mut SlashContext<'_>) {
+    let count = flint_agent::checkpoint::checkpoint_count(&sc.checkpoint_store);
+    if count == 0 {
+        println!("Nothing to undo.\n");
+        return;
+    }
+
+    let cp = flint_agent::checkpoint::pop_latest(&sc.checkpoint_store).unwrap();
+    let turn = cp.turn_number;
+    let file_count = cp.snapshots.len();
+    let mut restored = 0;
+    let mut deleted = 0;
+
+    for snap in &cp.snapshots {
+        let full = sc.working_dir.join(&snap.path);
+        match &snap.original_content {
+            Some(content) => {
+                // File existed before — restore original content
+                if let Err(e) = std::fs::write(&full, content) {
+                    eprintln!("  x failed to restore {}: {}", snap.path.display(), e);
+                } else {
+                    println!("  + restored {}", snap.path.display());
+                    restored += 1;
+                }
+            }
+            None => {
+                // File was newly created — delete it
+                if full.exists() {
+                    if let Err(e) = std::fs::remove_file(&full) {
+                        eprintln!("  x failed to delete {}: {}", snap.path.display(), e);
+                    } else {
+                        println!("  - deleted {}", snap.path.display());
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Also truncate the session messages back to before this turn
+    // Remove all messages from the checkpointed turn onwards
+    let msgs_before = sc.session.messages.len();
+    // Find messages that belong to this turn and remove them
+    // We remove the last N messages that were added during this turn
+    // Simple approach: keep only messages up to the point before this turn's user message
+    // Since we don't track message indices per turn, we remove the tail
+    // A better approach: count how many messages were added this turn
+    // For now, just warn the user that session messages are not rolled back
+    if restored > 0 || deleted > 0 {
+        println!(
+            "\nUndo turn {}: {} file(s) restored, {} deleted ({} checkpoint(s) remaining).",
+            turn, restored, deleted, count - 1
+        );
+        println!("Note: session messages were not rolled back. Use /clear to reset conversation.\n");
     }
 }

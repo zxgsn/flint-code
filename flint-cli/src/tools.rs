@@ -7,7 +7,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use flint_agent::{Tool, ToolContext, ToolRegistry};
 use flint_types::{ToolDefinition, ToolOutput};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Read ───────────────────────────────────────────────────────────────────
 
@@ -43,7 +45,10 @@ impl Tool for ReadTool {
 
 // ── Write ──────────────────────────────────────────────────────────────────
 
-pub struct WriteTool;
+pub struct WriteTool {
+    pub checkpoints: flint_agent::CheckpointStore,
+    pub turn: Arc<AtomicU32>,
+}
 
 #[async_trait]
 impl Tool for WriteTool {
@@ -71,6 +76,17 @@ impl Tool for WriteTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'content'"))?;
         let full = ctx.working_dir.join(path);
+
+        // Snapshot before modifying
+        let original = std::fs::read_to_string(&full).ok();
+        let rel = PathBuf::from(path);
+        flint_agent::checkpoint::record_snapshot(
+            &self.checkpoints,
+            self.turn.load(Ordering::Relaxed),
+            rel,
+            original,
+        );
+
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -81,7 +97,10 @@ impl Tool for WriteTool {
 
 // ── Edit ───────────────────────────────────────────────────────────────────
 
-pub struct EditTool;
+pub struct EditTool {
+    pub checkpoints: flint_agent::CheckpointStore,
+    pub turn: Arc<AtomicU32>,
+}
 
 #[async_trait]
 impl Tool for EditTool {
@@ -125,6 +144,15 @@ impl Tool for EditTool {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("{}: {}", full.display(), e))),
         };
+
+        // Snapshot before modifying
+        let rel = PathBuf::from(path);
+        flint_agent::checkpoint::record_snapshot(
+            &self.checkpoints,
+            self.turn.load(Ordering::Relaxed),
+            rel,
+            Some(content.clone()),
+        );
 
         let count = content.matches(old_string).count();
 
@@ -807,10 +835,20 @@ impl Tool for TodoTool {
 // ── Registration helper ────────────────────────────────────────────────────
 
 /// Register all built-in tools into the registry.
-pub fn register_builtins(registry: &mut ToolRegistry) {
+pub fn register_builtins(
+    registry: &mut ToolRegistry,
+    checkpoints: flint_agent::CheckpointStore,
+    turn: Arc<AtomicU32>,
+) {
     registry.register(ReadTool);
-    registry.register(WriteTool);
-    registry.register(EditTool);
+    registry.register(WriteTool {
+        checkpoints: checkpoints.clone(),
+        turn: turn.clone(),
+    });
+    registry.register(EditTool {
+        checkpoints: checkpoints.clone(),
+        turn: turn.clone(),
+    });
     registry.register(BashTool);
     registry.register(GrepTool);
     registry.register(GlobTool);

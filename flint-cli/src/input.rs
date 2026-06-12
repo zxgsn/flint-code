@@ -157,6 +157,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "Show status"),
     ("/swarm", "Swarm status / spawn terminal agent"),
     ("/poke", "Toggle auto-poke"),
+    ("/undo", "Revert last turn's file changes"),
     ("/help", "Show help"),
     ("/quit", "Exit"),
 ];

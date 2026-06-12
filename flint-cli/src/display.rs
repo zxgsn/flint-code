@@ -21,6 +21,7 @@ Built-in commands:
   /compact      Compress conversation history
   /poke         Toggle auto-poke (auto-continue when todos remain)
   /poke on/off  Enable or disable auto-poke
+  /undo         Revert file changes from the last turn
   /clear        Clear conversation history
   /status       Show current config status
   /help         Show this help message

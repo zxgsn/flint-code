@@ -32,6 +32,8 @@ pub async fn run(
     mut swarm: Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
     swarm_notify: Option<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>,
     mut auto_poke: Option<auto_poke::AutoPoke>,
+    checkpoint_store: flint_agent::CheckpointStore,
+    turn_counter: Arc<std::sync::atomic::AtomicU32>,
     initial_message: Option<String>,
     message_file: Option<String>,
     router_addr: Option<String>,
@@ -74,6 +76,7 @@ pub async fn run(
     if auto_poke.is_some() {
         println!("Auto-poke: enabled (todo tool active) -- /poke to toggle");
     }
+    println!("Checkpoints: enabled (file snapshots per turn) -- /undo to revert");
 
     println!();
 
@@ -131,6 +134,7 @@ pub async fn run(
     // Process initial message if provided (e.g., from --initial-message flag)
     if let Some(ref msg) = initial_message {
         turn_count += 1;
+        turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
         eprintln!("\x1b[34m{}>\x1b[0m {}", turn_count, msg);
         session.add_user(msg);
         cancel.store(false, Ordering::Relaxed);
@@ -217,6 +221,7 @@ pub async fn run(
                 &format!("[Message from {}]: {}", from, content)
             ));
             turn_count += 1;
+            turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
             let effective_system = system.to_string();
             match run_turn(
                 prov.as_ref(), &mut session, &registry, &effective_system, ctx,
@@ -351,6 +356,7 @@ pub async fn run(
                 );
                 session.messages.push(flint_types::Message::system(&result_msg));
                 turn_count += 1;
+                turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
                 let effective_system = system.to_string();
                 match run_turn(
                     prov.as_ref(), &mut session, &registry, &effective_system, ctx,
@@ -399,6 +405,8 @@ pub async fn run(
                 memory: &mut memory,
                 swarm: &mut swarm,
                 auto_poke: &mut auto_poke,
+                checkpoint_store: checkpoint_store.clone(),
+                turn_counter: turn_counter.clone(),
                 system,
                 turn_count,
                 total_tool_calls,
@@ -415,6 +423,7 @@ pub async fn run(
 
         // Normal message -> send to LLM
         turn_count += 1;
+        turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
         eprintln!("\x1b[34m{}>\x1b[0m {}", turn_count, input);
 
         // Reset auto-poke counter on user input
@@ -517,6 +526,7 @@ pub async fn run(
                     };
 
                     turn_count += 1;
+                    turn_counter.store(turn_count, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "\x1b[33m  [auto-poke {}/{}]\x1b[0m {}",
                         auto_poke.as_ref().map(|a| a.consecutive_pokes).unwrap_or(0),

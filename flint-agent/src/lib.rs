@@ -1,11 +1,13 @@
 //! Agent runtime for flint — loop, tools, and session management.
 
 pub mod agent;
+pub mod checkpoint;
 pub mod session;
 pub mod todo;
 pub mod tool;
 
 pub use agent::{run_turn, TurnStats};
+pub use checkpoint::CheckpointStore;
 pub use session::{Session, SessionMeta};
 pub use todo::TodoStore;
 pub use tool::{Tool, ToolContext, ToolRegistry};
