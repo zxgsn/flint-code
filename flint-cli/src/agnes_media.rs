@@ -51,13 +51,87 @@ fn base_url() -> String {
         .unwrap_or_else(|_| "https://apihub.agnes-ai.com".to_string())
 }
 
+fn format_elapsed_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m{}s", secs / 60, secs % 60)
+    }
+}
+
+// ── Video URL extraction ───────────────────────────────────────────────────
+
+/// Extract video URL from a task response.
+/// The Agnes API returns the video URL in `remixed_from_video_id` field.
+fn extract_video_url(task: &VideoTaskResponse) -> String {
+    // 1. remixed_from_video_id — actual video URL from Agnes API
+    if let Some(ref u) = task.remixed_from_video_id {
+        if !u.is_empty() && u.starts_with("http") { return u.clone(); }
+    }
+    // 2. Direct URL fields
+    if let Some(ref u) = task.video_url {
+        if !u.is_empty() { return u.clone(); }
+    }
+    if let Some(ref u) = task.url {
+        if !u.is_empty() { return u.clone(); }
+    }
+    // 3. Nested in output/data/result objects
+    let nested_objs = [&task.output, &task.data, &task.result];
+    for obj in nested_objs.iter().filter_map(|o| o.as_ref()) {
+        for key in &["url", "video_url", "video", "download_url"] {
+            if let Some(u) = obj[key].as_str() {
+                if !u.is_empty() { return u.to_string(); }
+            }
+        }
+    }
+    // 4. Fallback: video_id
+    if let Some(ref id) = task.video_id {
+        if !id.is_empty() { return id.clone(); }
+    }
+    "(no URL in response)".to_string()
+}
+
+/// Format optional video metadata (size, duration).
+fn format_video_meta(task: &VideoTaskResponse) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref s) = task.size {
+        parts.push(format!("Size: {}", s));
+    }
+    if let Some(ref s) = task.seconds {
+        parts.push(format!("Duration: {}s", s));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", parts.join(", "))
+    }
+}
+
+/// Video task response — matches Agnes AI agnesapi?video_id= endpoint.
+#[derive(serde::Deserialize)]
+struct VideoTaskResponse {
+    status: Option<String>,
+    progress: Option<f64>,
+    video_id: Option<String>,
+    remixed_from_video_id: Option<String>,
+    video_url: Option<String>,
+    url: Option<String>,
+    output: Option<serde_json::Value>,
+    data: Option<serde_json::Value>,
+    result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
+    completed_at: Option<serde_json::Value>,
+    seconds: Option<String>,
+    size: Option<String>,
+}
+
 // ── VideoGen Tool ──────────────────────────────────────────────────────────
 
 /// Async video generation tool.
 ///
 /// Workflow:
-/// 1. POST /v1/videos → returns task_id
-/// 2. GET /v1/videos/{task_id} → polls until done, returns video URL
+/// 1. POST /v1/videos → returns video_id
+/// 2. GET /agnesapi?video_id=<VIDEO_ID> → polls until done, returns video URL
 ///
 /// Supports text-to-video and image-to-video.
 pub struct VideoGenTool;
@@ -71,10 +145,8 @@ impl Tool for VideoGenTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "video_gen".into(),
-            description: "Generate a video from a text prompt or input image using \
-                the Agnes AI video generation model (agnes-video-v2.0). \
-                This is an async operation: submits the task, polls for completion, \
-                and returns the video URL. \
+            description: "Generate a video from text prompt or image using Agnes AI \
+                (agnes-video-v2.0). Async: submits task, polls via video_id, returns URL. \
                 Input: {\"prompt\": \"...\", \"image_url\": \"...\" (optional), \
                 \"num_frames\": 129, \"fps\": 8}"
                 .into(),
@@ -148,31 +220,36 @@ impl Tool for VideoGenTool {
             )));
         }
 
-        // Parse response for task_id
+        // Parse response for video_id (preferred) or task_id
         #[derive(serde::Deserialize)]
         struct SubmitResponse {
             task_id: Option<String>,
             id: Option<String>,
-            #[allow(dead_code)]
+            video_id: Option<String>,
             error: Option<serde_json::Value>,
         }
         let submit: SubmitResponse = resp.json().await?;
-        let task_id = submit.task_id.or(submit.id).ok_or_else(|| {
-            anyhow::anyhow!("video generation submitted but no task_id returned")
+        let video_id = submit.video_id.or(submit.id).ok_or_else(|| {
+            anyhow::anyhow!("video generation submitted but no video_id returned")
         })?;
 
-        // Step 2: Poll for completion
-        let retrieve_url = format!("{}/v1/videos/{}", base, task_id);
+        // Step 2: Poll for completion using video_id (recommended by API docs)
+        // Endpoint: GET https://apihub.agnes-ai.com/agnesapi?video_id=<VIDEO_ID>
+        let retrieve_url = format!("{}/agnesapi?video_id={}", base, video_id);
         let mut attempts = 0u32;
-        let max_attempts = 120; // 10 minutes with 5s interval
-        let poll_interval = std::time::Duration::from_secs(5);
+        let max_attempts = 60; // 10 minutes with 10s interval
+        let poll_interval = std::time::Duration::from_secs(10);
+        let poll_start = std::time::Instant::now();
+        let mut last_reported_progress: i64 = -1;
 
         loop {
             if attempts >= max_attempts {
                 return Ok(ToolOutput::text(format!(
-                    "Video generation task {} is still processing. \
-                     Use task_id {} to check later at {}/v1/videos/{}.",
-                    task_id, task_id, base, task_id
+                    "Video {} still processing after {}. \
+                     Check: GET {}/agnesapi?video_id={}",
+                    video_id,
+                    format_elapsed_secs(poll_start.elapsed().as_secs()),
+                    base, video_id
                 )));
             }
 
@@ -185,57 +262,72 @@ impl Tool for VideoGenTool {
             if !poll_status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 return Ok(ToolOutput::error(format!(
-                    "failed to poll task {}: HTTP {} {}",
-                    task_id, poll_status, text
+                    "failed to poll video {}: HTTP {} {}",
+                    video_id, poll_status, text
                 )));
             }
 
-            #[derive(serde::Deserialize)]
-            struct TaskResponse {
-                status: Option<String>,
-                progress: Option<f64>,
-                output: Option<serde_json::Value>,
-                video_url: Option<String>,
-                url: Option<String>,
-                remixed_from_video_id: Option<String>,
-                video_id: Option<String>,
-                error: Option<String>,
-                #[allow(dead_code)]
-                task_id: Option<String>,
-            }
-            let task: TaskResponse = resp.json().await?;
+            // Get raw response text for flexible parsing
+            let resp_text = resp.text().await?;
 
-            // Check for completion by status or progress
-            let is_completed = matches!(task.status.as_deref(), Some("completed"))
-                || task.progress.map(|p| p >= 100.0).unwrap_or(false);
-            let is_failed = matches!(task.status.as_deref(), Some("failed") | Some("error"));
+            let task: VideoTaskResponse = match serde_json::from_str(&resp_text) {
+                Ok(t) => t,
+                Err(_) => {
+                    return Ok(ToolOutput::error(format!(
+                        "Failed to parse poll response for video {}:\n{}",
+                        video_id, &resp_text[..resp_text.len().min(500)]
+                    )));
+                }
+            };
+
+            let status_str = task.status.as_deref().unwrap_or("unknown");
+            let progress = task.progress.map(|p| p as i64).unwrap_or(0);
+
+            // Broad completion detection — API may use any of these
+            let is_completed = matches!(
+                status_str,
+                "completed" | "succeeded" | "done" | "finished" | "success"
+            ) || progress >= 100 || task.completed_at.is_some();
+
+            let is_failed = matches!(
+                status_str,
+                "failed" | "error" | "cancelled" | "canceled"
+            );
 
             if is_completed {
-                // Extract video URL from various possible fields
-                let video_url = task.remixed_from_video_id
-                    .or(task.video_url)
-                    .or(task.url)
-                    .or_else(|| task.output.as_ref().and_then(|o| o["url"].as_str().map(String::from)))
-                    .or_else(|| task.output.as_ref().and_then(|o| o["video_url"].as_str().map(String::from)))
-                    .unwrap_or_else(|| task.video_id.clone().unwrap_or_else(|| "(completed, check UI)".to_string()));
-
+                let video_url = extract_video_url(&task);
+                let meta = format_video_meta(&task);
                 return Ok(ToolOutput::text(format!(
-                    "✅ Video generation complete!\n\
-                     Task ID: {}\n\
-                     Video URL: {}\n\
-                     Prompt: {}",
-                    task_id, video_url, prompt
+                    "✅ Video generated!\nURL: {}\nID: {}{}",
+                    video_url, video_id, meta
                 )));
             }
 
             if is_failed {
-                let err_msg = task.error.unwrap_or_else(|| "unknown error".to_string());
+                let err_msg = task.error
+                    .map(|e| match e {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
                 return Ok(ToolOutput::error(format!(
-                    "Video generation failed: {}", err_msg
+                    "Video generation failed ({}): {}",
+                    status_str, err_msg
                 )));
             }
 
-            // Still running (queued, processing, pending, or low progress)
+            // Log progress only when it changes and is > 0
+            if progress > 0 && progress != last_reported_progress {
+                last_reported_progress = progress;
+                let elapsed = format_elapsed_secs(poll_start.elapsed().as_secs());
+                eprintln!(
+                    "\x1b[90m  [video_gen] {}% ({} elapsed)\x1b[0m",
+                    progress, elapsed
+                );
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+            }
+
             attempts += 1;
             tokio::time::sleep(poll_interval).await;
         }
