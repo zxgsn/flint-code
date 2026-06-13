@@ -27,7 +27,7 @@ fn dim(s: &str) -> String {
     format!("\x1b[90m{}\x1b[0m", s)
 }
 
-fn green(s: &str) -> String {
+fn _green(s: &str) -> String {
     format!("\x1b[32m{}\x1b[0m", s)
 }
 
@@ -39,7 +39,7 @@ fn yellow(s: &str) -> String {
     format!("\x1b[33m{}\x1b[0m", s)
 }
 
-fn bold(s: &str) -> String {
+fn _bold(s: &str) -> String {
     format!("\x1b[1m{}\x1b[0m", s)
 }
 
@@ -116,11 +116,12 @@ pub async fn run_turn(
     max_output_chars: usize,
     silent: bool,
     callback: Option<&crate::EventCallback>,
-    render_fn: Option<&dyn Fn(&str)>,
+    render_fn: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<(String, TurnStats)> {
     let turn_start = Instant::now();
     let mut turn_iter = 0u32;
     let mut stats = TurnStats::default();
+    const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
     loop {
         turn_iter += 1;
@@ -366,9 +367,14 @@ pub async fn run_turn(
 
             // Truncate tool output if it exceeds max_output_chars
             let output = if output.text.len() > max_output_chars {
+                // Safe truncation at char boundary to avoid UTF-8 panic
+                let truncate_at = output.text.char_indices()
+                    .nth(max_output_chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(output.text.len());
                 let truncated_text = format!(
                     "{}\n\n[truncated — output was {} chars, limit is {}]",
-                    &output.text[..max_output_chars],
+                    &output.text[..truncate_at],
                     output.text.len(),
                     max_output_chars
                 );
@@ -401,6 +407,39 @@ pub async fn run_turn(
                     println!("  {} {}{} {}", dim("+"), dim(&preview), dim(truncated), dim(&format!("({})", format_elapsed(tool_elapsed))));
                 }
             }
+
+            // Circuit breaker: track consecutive same-tool errors (persists across turns)
+            let output = if output.is_error {
+                let tool_name = &tool_calls[i].name;
+                if session.circuit_breaker_last_tool.as_deref() == Some(tool_name) {
+                    session.circuit_breaker_count += 1;
+                } else {
+                    session.circuit_breaker_last_tool = Some(tool_name.clone());
+                    session.circuit_breaker_count = 1;
+                }
+                if session.circuit_breaker_count >= MAX_CONSECUTIVE_ERRORS {
+                    let warning = format!(
+                        "\n\n⚠ CIRCUIT BREAKER: This tool has failed {} consecutive times (across turns). \
+                        STOP retrying the same approach. Instead:\n\
+                        1. Use `read` to get the exact current file content before using `edit`.\n\
+                        2. If the task is complex, tell the user to run `/compact` to reduce context.\n\
+                        3. Try a completely different strategy.",
+                        session.circuit_breaker_count
+                    );
+                    flint_types::ToolOutput {
+                        text: format!("{}{}", output.text, warning),
+                        is_error: output.is_error,
+                    }
+                } else {
+                    output
+                }
+            } else {
+                // Reset on success
+                session.circuit_breaker_count = 0;
+                session.circuit_breaker_last_tool = None;
+                output
+            };
+
             session.add_tool_result(&tool_calls[i].id, &output);
         }
 

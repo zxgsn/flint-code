@@ -22,11 +22,11 @@ pub enum AgentFormat {
 #[derive(Debug, Deserialize)]
 struct ClaudeEvent {
     #[serde(rename = "type")]
-    event_type: String,
+    _event_type: String,
     #[serde(default)]
     message: Option<ClaudeMessage>,
     #[serde(default)]
-    uuid: Option<String>,
+    _uuid: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
     #[serde(default)]
@@ -150,7 +150,11 @@ fn import_claude_code(path: &Path) -> Result<(Session, SessionMeta)> {
         message_count: messages.len(),
     };
 
-    let session = Session { messages };
+    let session = Session {
+        messages,
+        circuit_breaker_last_tool: None,
+        circuit_breaker_count: 0,
+    };
     Ok((session, meta))
 }
 

@@ -50,8 +50,8 @@ impl AutoPoke {
             return None;
         }
 
-        let incomplete = flint_agent::todo::incomplete_count(&self.store);
-        if incomplete == 0 {
+        let todos = flint_agent::todo::incomplete_todos(&self.store);
+        if todos.is_empty() {
             // All done — no poke needed
             return None;
         }
@@ -67,10 +67,26 @@ impl AutoPoke {
         }
 
         self.consecutive_pokes += 1;
+        let incomplete = todos.len();
+        // Include actual todo titles so the agent knows what to work on
+        let todo_list: String = todos
+            .iter()
+            .take(5)
+            .map(|t| format!("  #{} [{}] {}", t.id, format!("{:?}", t.status).to_lowercase(), t.title))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if incomplete > 5 {
+            format!("\n  ... and {} more", incomplete - 5)
+        } else {
+            String::new()
+        };
         Some(format!(
-            "You have {} incomplete todo{}. Continue working, or use the todo tool to update status.",
+            "You have {} incomplete todo{}. Continue working:\n{}{}\n\n\
+             Use the todo tool to update status as you complete each item.",
             incomplete,
             if incomplete == 1 { "" } else { "s" },
+            todo_list,
+            more,
         ))
     }
 
@@ -95,9 +111,19 @@ impl AutoPoke {
     pub fn stop_for_error(&mut self, error_msg: &str) {
         if Self::is_non_retryable_error(error_msg) {
             self.enabled = false;
+            // Safe truncation at char boundary
+            let display = if error_msg.len() > 80 {
+                let end = error_msg.char_indices()
+                    .nth(80)
+                    .map(|(i, _)| i)
+                    .unwrap_or(error_msg.len());
+                &error_msg[..end]
+            } else {
+                error_msg
+            };
             eprintln!(
                 "\x1b[33m  [auto-poke] stopped due to error: {}\x1b[0m",
-                if error_msg.len() > 80 { &error_msg[..80] } else { error_msg }
+                display
             );
         }
     }

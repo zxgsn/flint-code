@@ -86,14 +86,14 @@ pub struct SlashContext<'a> {
     pub prov: &'a mut Arc<dyn Provider>,
     pub registry: &'a mut ToolRegistry,
     pub ctx: &'a ToolContext,
-    pub cancel: &'a Arc<AtomicBool>,
+    pub _cancel: &'a Arc<AtomicBool>,
     pub mcp_manager: &'a mut McpManager,
     pub working_dir: &'a Path,
     pub memory: &'a mut Option<Arc<Mutex<flint_memory::MemoryManager>>>,
     pub swarm: &'a mut Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
     pub auto_poke: &'a mut Option<crate::repl::auto_poke::AutoPoke>,
     pub checkpoint_store: flint_agent::CheckpointStore,
-    pub turn_counter: Arc<std::sync::atomic::AtomicU32>,
+    pub _turn_counter: Arc<std::sync::atomic::AtomicU32>,
     pub system: &'a str,
     pub turn_count: u32,
     pub total_tool_calls: u32,
@@ -116,8 +116,24 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
             dispatch_resume(arg, sc).await?;
         }
         SlashAction::Config => {
+            let old_type = sc.config.provider.r#type.clone();
+            let old_model = sc.config.provider.model.clone();
             crate::cmd_config(sc.working_dir)?;
             *sc.config = flint_config::load(Some(sc.working_dir))?;
+
+            // Rebuild provider if type or model changed
+            if sc.config.provider.r#type != old_type || sc.config.provider.model != old_model {
+                // Reload .env in case API key/URL changed
+                let env_path = crate::provider::resolve_env_path(sc.working_dir);
+                crate::provider::load_env_override(&env_path);
+                match crate::provider::build_provider(&sc.config.provider.r#type, &sc.config.provider.model) {
+                    Ok(p) => {
+                        *sc.prov = Arc::from(p);
+                        eprintln!("Provider: {} / {}\n", sc.config.provider.r#type, sc.config.provider.model);
+                    }
+                    Err(e) => eprintln!("Failed to rebuild provider: {}\n", e),
+                }
+            }
 
             // Re-initialize memory if it was just enabled
             if sc.config.features.is_enabled(flint_config::Feature::Memory) && sc.memory.is_none() {
@@ -465,6 +481,8 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                 Ok(p) => {
                     *sc.prov = Arc::from(p);
                     sc.config.provider.model = m.clone();
+                    // Sync env var so it reflects the current model
+                    std::env::set_var("FLINT_MODEL", &m);
                     // Track in recent if not a preset
                     if !crate::model_ui::is_preset(&sc.config.provider.r#type, &m)
                         && !sc.config.provider.recent_models.contains(&m)
@@ -500,6 +518,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                                         *sc.prov = Arc::from(p);
                                         sc.config.provider.r#type = p_type;
                                         sc.config.provider.model = m.clone();
+                                        std::env::set_var("FLINT_MODEL", &m);
                                         let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
                                         println!("Switched to model: {}\n", m);
                                     }
@@ -514,6 +533,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                             Ok(p) => {
                                 *sc.prov = Arc::from(p);
                                 sc.config.provider.model = m.clone();
+                                std::env::set_var("FLINT_MODEL", &m);
                                 let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
                                 println!("Switched to model: {}\n", m);
                             }

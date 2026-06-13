@@ -1,5 +1,5 @@
-//! flint — Easy-to-hack agent harness in Rust.
 
+mod agnes_media;
 mod cli;
 mod config_ui;
 mod display;
@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 fn cmd_config(working_dir: &std::path::Path) -> Result<()> {
     let config = flint_config::load(Some(working_dir))?;
     let save_path = config.save_path(Some(working_dir));
-    config_ui::run(config, &save_path)?;
+    let env_path = provider::resolve_env_path(working_dir);
+    config_ui::run(config, &save_path, env_path)?;
     Ok(())
 }
 
@@ -144,20 +145,45 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     let env_path = provider::resolve_env_path(working_dir);
     let mut config = flint_config::load(Some(working_dir))?;
 
-    // Resolve provider: CLI > env > config
+    // Resolve provider: CLI > config > env
+    // Config file takes precedence over env vars because /model saves to config.
+    // If we used env > config, the model set via /model would be ignored on restart
+    // whenever FLINT_MODEL is set in .env.
     let env_provider = std::env::var("FLINT_PROVIDER").ok();
     let env_model = std::env::var("FLINT_MODEL").ok();
 
     let provider_type = args
         .provider
         .clone()
-        .or_else(|| env_provider.clone())
+        .or_else(|| {
+            // Env var only used if config has default value
+            if env_provider.is_some() && env_provider.as_deref() != Some(&config.provider.r#type) {
+                env_provider.clone()
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| config.provider.r#type.clone());
     let model = args
         .model
         .clone()
-        .or_else(|| env_model.clone())
-        .unwrap_or_else(|| config.provider.model.clone());
+        .unwrap_or_else(|| {
+            // Config file value takes precedence over env var.
+            // This ensures /model changes persist across restarts.
+            config.provider.model.clone()
+        });
+
+    // Warn if env var would have been used but is being ignored
+    if args.model.is_none() {
+        if let Some(ref env_m) = env_model {
+            if env_m != &config.provider.model {
+                eprintln!(
+                    "\x1b[90m  FLINT_MODEL={} ignored (config model '{}' takes precedence)\x1b[0m",
+                    env_m, config.provider.model
+                );
+            }
+        }
+    }
 
     // Build provider; on failure, launch setup wizard
     let raw_prov: Box<dyn Provider> = match provider::build_provider(&provider_type, &model) {
@@ -212,6 +238,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     let checkpoint_store = flint_agent::checkpoint::new_store();
     let turn_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     tools::register_builtins(&mut registry, checkpoint_store.clone(), turn_counter.clone());
+    agnes_media::register_agnes_tools(&mut registry);
 
     // Auto-poke hint in system prompt (only for main agents, not sub-agents)
     if args.spawn_context.is_none() {
@@ -222,7 +249,11 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             3. `todo update` each to `completed` when done\n\n\
             Simple single-step tasks (one read, one write, one question) do not need todos.\n\
             After each turn with incomplete todos, you will receive an automatic \
-            \"continue working\" prompt — keep going until all are done.");
+            \"continue working\" prompt — keep going until all are done.\n\n\
+            ## Agnes Media Generation\n\
+            - `image_gen`: Generate an image from text. Requires `prompt`.\n\
+            - `video_gen`: Generate a video from text (async). Requires `prompt`. Supports `image_url` for image-to-video.\n\
+            - Set `AGNES_API_KEY` environment variable with your Agnes AI API key to use these tools.");
     }
 
     // Initialize memory system (if enabled)
@@ -253,11 +284,15 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             None
         };
 
-    // Initialize todo system and auto-poke (main agent only, not sub-agents)
+    // Initialize todo system (main agent only, not sub-agents)
     let todo_store = flint_agent::todo::new_store();
     let auto_poke = if args.spawn_context.is_none() {
         tools::register_todo_tool(&mut registry, todo_store.clone());
-        Some(crate::repl::auto_poke::AutoPoke::new(todo_store))
+        if config.features.auto_poke.enabled {
+            Some(crate::repl::auto_poke::AutoPoke::new(todo_store))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -283,6 +318,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             Err(e) => eprintln!("MCP error: {}", e),
         }
     }
+
+    // Register Agnes AI media tools (video + image generation)
+    agnes_media::register_agnes_tools(&mut registry);
 
     let ctx = ToolContext {
         working_dir: working_dir.to_path_buf(),

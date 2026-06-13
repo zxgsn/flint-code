@@ -2,7 +2,7 @@ use std::path::Path;
 
 #[test]
 fn test_claude_code_format_detection() {
-    let test_file = Path::new("/tmp/test_session.jsonl");
+    let test_file = std::env::temp_dir().join("test_session.jsonl");
 
     // Create test file
     let content = r#"{"type":"last-prompt","leafUuid":"test-uuid","sessionId":"test-session-123"}
@@ -23,7 +23,7 @@ fn test_claude_code_format_detection() {
 
 #[test]
 fn test_flint_format_detection() {
-    let test_file = Path::new("/tmp/test_flint_session.json");
+    let test_file = std::env::temp_dir().join("test_flint_session.json");
 
     // Create test file
     let content = r#"{

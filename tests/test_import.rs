@@ -2,7 +2,7 @@ use std::path::Path;
 
 #[test]
 fn test_claude_code_import() {
-    let test_file = Path::new("/tmp/test_session.jsonl");
+    let test_file = std::env::temp_dir().join("test_session.jsonl");
 
     // Check if file exists
     if !test_file.exists() {
@@ -48,7 +48,7 @@ fn test_flint_session_save_load() {
     use flint_agent::Session;
     use flint_types::Message;
 
-    let test_dir = Path::new("/tmp/flint_test_sessions");
+    let test_dir = std::env::temp_dir().join("flint_test_sessions");
     if !test_dir.exists() {
         std::fs::create_dir_all(test_dir).unwrap();
     }

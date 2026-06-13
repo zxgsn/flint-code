@@ -419,14 +419,14 @@ pub async fn run(
                 prov: &mut prov,
                 registry: &mut registry,
                 ctx,
-                cancel: &cancel,
+                _cancel: &cancel,
                 mcp_manager: &mut mcp_manager,
                 working_dir,
                 memory: &mut memory,
                 swarm: &mut swarm,
                 auto_poke: &mut auto_poke,
                 checkpoint_store: checkpoint_store.clone(),
-                turn_counter: turn_counter.clone(),
+                _turn_counter: turn_counter.clone(),
                 system,
                 turn_count,
                 total_tool_calls,
@@ -488,6 +488,35 @@ pub async fn run(
         session.add_user(&input);
         cancel.store(false, Ordering::Relaxed);
 
+        // Pre-send compaction: compact BEFORE the API call if session is too large.
+        // This prevents context_length_exceeded errors from the API.
+        if config.features.is_enabled(Feature::Compaction) {
+            let total_chars: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
+            let threshold = (config.agent.context_window_chars as f64 * 0.8) as usize;
+            if total_chars > threshold && session.messages.len() > 6 {
+                eprintln!(
+                    "\x1b[90m  pre-send compact: {} chars exceeds {} threshold\x1b[0m",
+                    total_chars, threshold
+                );
+                let pre_compact_count = session.messages.len();
+                dispatch_auto_compact(
+                    &mut session,
+                    &mut current_session_meta,
+                    &*prov,
+                    &registry,
+                    ctx,
+                )
+                .await;
+                // Save immediately after compaction so the compacted state
+                // is persisted even if the turn fails or user exits.
+                if session.messages.len() < pre_compact_count {
+                    if let Some(meta) = save_session(&session, &current_session_meta, &config) {
+                        current_session_meta = Some(meta);
+                    }
+                }
+            }
+        }
+
         // Remember the last assistant message index for extraction
         let pre_turn_msg_count = session.messages.len();
 
@@ -523,17 +552,17 @@ pub async fn run(
                 total_tool_calls += stats.tool_calls;
 
                 // Auto-extract memories from the conversation (if enabled)
+                // Spawns as a background task — does not block the REPL.
                 if config.features.memory.auto_extract {
                     if let Some(ref mem) = memory {
-                        auto_extract_memories(
-                            mem,
-                            &session,
+                        spawn_auto_extract(
+                            Arc::clone(mem),
+                            session.messages.clone(),
                             pre_turn_msg_count,
-                            &*prov,
-                            &registry,
-                            ctx,
-                        )
-                        .await;
+                            Arc::clone(&prov),
+                            registry.clone(),
+                            ctx.clone(),
+                        );
                     }
                 }
 
@@ -673,13 +702,14 @@ pub async fn run(
 
         // Auto-compaction: if session exceeds 80% of context window, compact automatically
         if config.features.is_enabled(Feature::Compaction) {
-            let total_chars: usize = session.messages.iter().map(|m| m.text().len()).sum();
+            let total_chars: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
             let threshold = (config.agent.context_window_chars as f64 * 0.8) as usize;
             if total_chars > threshold && session.messages.len() > 6 {
                 eprintln!(
                     "\x1b[90m  auto-compact: {} chars exceeds {} threshold\x1b[0m",
                     total_chars, threshold
                 );
+                let pre_compact_count = session.messages.len();
                 dispatch_auto_compact(
                     &mut session,
                     &mut current_session_meta,
@@ -688,39 +718,59 @@ pub async fn run(
                     ctx,
                 )
                 .await;
-            }
-        }
-
-        // Auto-save session
-        if config.session.persistence && !session.is_empty() {
-            let session_dir = &config.session.path;
-            if !session_dir.exists() {
-                let _ = std::fs::create_dir_all(session_dir);
-            }
-
-            match &current_session_meta {
-                Some(meta) => {
-                    let path = session_dir.join(format!("{}.json", meta.id));
-                    if let Err(e) = session.update_save(&path, meta) {
-                        eprintln!("Warning: Failed to save session: {}", e);
-                    }
-                }
-                None => {
-                    let path = session_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
-                    if let Err(e) =
-                        session.save(&path, &config.provider.r#type, &config.provider.model)
-                    {
-                        eprintln!("Warning: Failed to save session: {}", e);
-                    } else if let Ok((_, meta)) = flint_agent::Session::load(&path) {
+                // Save immediately after compaction
+                if session.messages.len() < pre_compact_count {
+                    if let Some(meta) = save_session(&session, &current_session_meta, &config) {
                         current_session_meta = Some(meta);
                     }
                 }
             }
         }
+
+        // Auto-save session
+        if let Some(meta) = save_session(&session, &current_session_meta, &config) {
+            current_session_meta = Some(meta);
+        }
     }
 
     mcp_manager.shutdown().await;
     Ok(())
+}
+
+/// Save session to disk if persistence is enabled.
+/// Returns a new SessionMeta if one was created (first save).
+fn save_session(
+    session: &Session,
+    current_session_meta: &Option<flint_agent::SessionMeta>,
+    config: &flint_config::Config,
+) -> Option<flint_agent::SessionMeta> {
+    if !config.session.persistence || session.is_empty() {
+        return None;
+    }
+    let session_dir = &config.session.path;
+    if !session_dir.exists() {
+        let _ = std::fs::create_dir_all(session_dir);
+    }
+    match current_session_meta {
+        Some(meta) => {
+            let path = session_dir.join(format!("{}.json", meta.id));
+            if let Err(e) = session.update_save(&path, meta) {
+                eprintln!("Warning: Failed to save session: {}", e);
+            }
+            None
+        }
+        None => {
+            let path = session_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+            if let Err(e) =
+                session.save(&path, &config.provider.r#type, &config.provider.model)
+            {
+                eprintln!("Warning: Failed to save session: {}", e);
+                None
+            } else {
+                flint_agent::Session::load(&path).ok().map(|(_, meta)| meta)
+            }
+        }
+    }
 }
 
 /// Auto-compaction: summarize session and replace with compact form.
@@ -733,6 +783,9 @@ async fn dispatch_auto_compact(
 ) {
     let msg_count = session.messages.len();
 
+    // Use estimated_chars for accurate size including tool blocks
+    let total_estimated: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
+
     let mut history = String::new();
     for msg in &session.messages {
         let role = match msg.role {
@@ -741,10 +794,41 @@ async fn dispatch_auto_compact(
             flint_types::Role::System => "System",
             flint_types::Role::Tool => "Tool",
         };
-        let text = msg.text();
-        if !text.is_empty() {
-            history.push_str(&format!("{}: {}\n\n", role, text));
+        // Include tool block info in the summary for better context preservation
+        for block in &msg.content {
+            let text = match block {
+                flint_types::ContentBlock::Text { text } => text.clone(),
+                flint_types::ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[tool call: {}({})]", name, input)
+                }
+                flint_types::ContentBlock::ToolResult { content, is_error, .. } => {
+                    if is_error == &Some(true) {
+                        format!("[tool error: {}]", content)
+                    } else {
+                        content.clone()
+                    }
+                }
+            };
+            if !text.is_empty() {
+                history.push_str(&format!("{}: {}\n\n", role, text));
+            }
         }
+    }
+
+    // Truncate history if too large for the summarizer to handle
+    // Leave room for the summarizer prompt and response
+    const MAX_SUMMARY_INPUT: usize = 200_000;
+    if history.len() > MAX_SUMMARY_INPUT {
+        let truncate_at = history.char_indices()
+            .nth(MAX_SUMMARY_INPUT)
+            .map(|(i, _)| i)
+            .unwrap_or(history.len());
+        history = format!(
+            "{}\n\n[... truncated from {} to {} chars for summarization ...]",
+            &history[..truncate_at],
+            total_estimated,
+            MAX_SUMMARY_INPUT
+        );
     }
 
     let compact_prompt = format!(
@@ -801,16 +885,18 @@ async fn dispatch_auto_compact(
 }
 
 /// Extract memories from the latest conversation turn using the LLM.
-async fn auto_extract_memories(
-    memory: &Arc<Mutex<flint_memory::MemoryManager>>,
-    session: &Session,
+/// Spawn memory extraction as a background task so the REPL returns to the
+/// prompt immediately. The extraction reads the last user/assistant exchange
+/// from `messages`, calls the LLM, and stores any extracted facts.
+fn spawn_auto_extract(
+    memory: Arc<Mutex<flint_memory::MemoryManager>>,
+    messages: Vec<flint_types::Message>,
     pre_turn_msg_count: usize,
-    prov: &dyn Provider,
-    registry: &ToolRegistry,
-    ctx: &ToolContext,
+    prov: Arc<dyn Provider>,
+    registry: ToolRegistry,
+    ctx: ToolContext,
 ) {
     // Find the last user message and assistant response
-    let messages = &session.messages;
     let mut last_user = None;
     let mut last_assistant = None;
 
@@ -837,63 +923,65 @@ async fn auto_extract_memories(
         return;
     }
 
-    let mm = memory.lock().unwrap();
-    let extract_prompt = mm.extraction_prompt(&user_msg, &assistant_msg);
-    drop(mm);
+    let extract_prompt = {
+        let mm = memory.lock().unwrap();
+        mm.extraction_prompt(&user_msg, &assistant_msg)
+    };
 
-    // Use a temporary session for extraction
-    let mut extract_session = Session::new();
-    extract_session.add_user(&extract_prompt);
+    tokio::spawn(async move {
+        let mut extract_session = Session::new();
+        extract_session.add_user(&extract_prompt);
 
-    match run_turn(
-        prov,
-        &mut extract_session,
-        registry,
-        "You are a memory extraction system. Output only valid JSON.",
-        ctx,
-        3,
-        None,
-        65536,
-        true, // silent
-        None,
-        None,
-    )
-    .await
-    {
-        Ok((response, _)) => {
-            if response.is_empty() {
-                return;
-            }
+        match run_turn(
+            prov.as_ref(),
+            &mut extract_session,
+            &registry,
+            "You are a memory extraction system. Output only valid JSON.",
+            &ctx,
+            3,
+            None,
+            65536,
+            true, // silent
+            None,
+            None,
+        )
+        .await
+        {
+            Ok((response, _)) => {
+                if response.is_empty() {
+                    return;
+                }
 
-            let mut mm = memory.lock().unwrap();
-            let extracted = mm.parse_extracted(&response);
-            if !extracted.is_empty() {
-                match mm.store_extracted(&extracted, flint_memory::MemoryScope::Project) {
-                    Ok(ids) => {
-                        if !ids.is_empty() {
-                            eprintln!(
-                                "\x1b[90m  memory: extracted {} fact(s)\x1b[0m",
-                                ids.len()
-                            );
+                let mut mm = memory.lock().unwrap();
+                let extracted = mm.parse_extracted(&response);
+                if !extracted.is_empty() {
+                    match mm.store_extracted(&extracted, flint_memory::MemoryScope::Project) {
+                        Ok(ids) => {
+                            if !ids.is_empty() {
+                                eprintln!(
+                                    "\x1b[90m  memory: extracted {} fact(s)\x1b[0m",
+                                    ids.len()
+                                );
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!("memory extraction storage failed: {}", e);
+                        Err(e) => {
+                            tracing::warn!("memory extraction storage failed: {}", e);
+                        }
                     }
                 }
             }
+            Err(e) => {
+                tracing::warn!("memory extraction failed: {}", e);
+            }
         }
-        Err(e) => {
-            tracing::warn!("memory extraction failed: {}", e);
-        }
-    }
+    });
 }
 
 /// Display and interact with an interactive agent's streaming output.
 /// Called after `swarm spawn` creates an interactive agent.
 /// Polls the agent's stream channel, displays output with markdown rendering,
 /// and forwards user input when the agent requests it.
-pub async fn display_agent_output(
+pub async fn _display_agent_output(
     swarm: &std::sync::Arc<std::sync::Mutex<flint_swarm::SwarmManager>>,
     agent_id: &str,
 ) -> Result<()> {
@@ -1112,7 +1200,7 @@ fn perform_undo(
 
     let cp = flint_agent::checkpoint::pop_latest(checkpoint_store).unwrap();
     let turn = cp.turn_number;
-    let file_count = cp.snapshots.len();
+    let _file_count = cp.snapshots.len();
     let mut restored = 0;
     let mut deleted = 0;
 

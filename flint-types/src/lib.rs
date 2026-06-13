@@ -106,6 +106,24 @@ impl Message {
             .collect::<Vec<_>>()
             .join("")
     }
+
+    /// Estimate total character count including all content blocks
+    /// (text, tool use inputs, tool result contents).
+    /// This is more accurate than `text()` for context window management.
+    pub fn estimated_chars(&self) -> usize {
+        self.content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::ToolUse { id, name, input } => {
+                    id.len() + name.len() + input.to_string().len()
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id, content, ..
+                } => tool_use_id.len() + content.len(),
+            })
+            .sum()
+    }
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────

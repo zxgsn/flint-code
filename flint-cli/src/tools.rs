@@ -69,12 +69,14 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let content = input["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'content'"))?;
+        let path = match input["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(ToolOutput::error("missing required parameter 'path'")),
+        };
+        let content = match input["content"].as_str() {
+            Some(c) => c,
+            None => return Ok(ToolOutput::error("missing required parameter 'content'")),
+        };
         let full = ctx.working_dir.join(path);
 
         // Snapshot before modifying
@@ -88,9 +90,19 @@ impl Tool for WriteTool {
         );
 
         if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(ToolOutput::error(format!(
+                    "cannot create directory {}: {}",
+                    parent.display(), e
+                )));
+            }
         }
-        std::fs::write(&full, content)?;
+        if let Err(e) = std::fs::write(&full, content) {
+            return Ok(ToolOutput::error(format!(
+                "cannot write {}: {}",
+                full.display(), e
+            )));
+        }
         Ok(ToolOutput::text(format!("wrote {}", full.display())))
     }
 }
@@ -124,15 +136,18 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let old_string = input["old_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'old_string'"))?;
-        let new_string = input["new_string"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'new_string'"))?;
+        let path = match input["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(ToolOutput::error("missing required parameter 'path'")),
+        };
+        let old_string = match input["old_string"].as_str() {
+            Some(s) => s,
+            None => return Ok(ToolOutput::error("missing required parameter 'old_string'")),
+        };
+        let new_string = match input["new_string"].as_str() {
+            Some(s) => s,
+            None => return Ok(ToolOutput::error("missing required parameter 'new_string'")),
+        };
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
         if old_string.is_empty() {
@@ -145,21 +160,35 @@ impl Tool for EditTool {
             Err(e) => return Ok(ToolOutput::error(format!("{}: {}", full.display(), e))),
         };
 
-        // Snapshot before modifying
-        let rel = PathBuf::from(path);
-        flint_agent::checkpoint::record_snapshot(
-            &self.checkpoints,
-            self.turn.load(Ordering::Relaxed),
-            rel,
-            Some(content.clone()),
-        );
+        // Detect file's line ending style and normalize for matching.
+        // The LLM always uses \n, but files on Windows may use \r\n.
+        let uses_crlf = content.contains("\r\n");
+        let normalized_content = if uses_crlf {
+            content.replace("\r\n", "\n")
+        } else {
+            content.clone()
+        };
+        let normalized_old = old_string.replace("\r\n", "\n");
+        let normalized_new = new_string.replace("\r\n", "\n");
 
-        let count = content.matches(old_string).count();
+        let count = normalized_content.matches(&*normalized_old).count();
 
         if count == 0 {
+            // Provide diagnostic context so the LLM can self-correct
+            let line_count = content.lines().count();
+            let byte_size = content.len();
+            let preview: String = old_string.chars().take(100).collect();
+            let suffix = if old_string.len() > 100 { "..." } else { "" };
+            let crlf_hint = if uses_crlf && !old_string.contains("\r\n") {
+                "\nNote: file uses CRLF (\\r\\n) line endings — matching normalized to LF."
+            } else {
+                ""
+            };
             return Ok(ToolOutput::error(format!(
-                "old_string not found in {}",
-                full.display()
+                "old_string not found in {} (file has {} lines, {} bytes).\n\
+                 Searched for: \"{}{}\"\n\
+                 Hint: use the `read` tool to get the exact current file content before using `edit`.{}",
+                full.display(), line_count, byte_size, preview, suffix, crlf_hint
             )));
         }
 
@@ -171,13 +200,32 @@ impl Tool for EditTool {
             )));
         }
 
-        let new_content = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            content.replacen(old_string, new_string, 1)
-        };
+        // Snapshot before modifying (only when edit will succeed)
+        let rel = PathBuf::from(path);
+        flint_agent::checkpoint::record_snapshot(
+            &self.checkpoints,
+            self.turn.load(Ordering::Relaxed),
+            rel,
+            Some(content.clone()),
+        );
 
-        std::fs::write(&full, &new_content)?;
+        // Perform replacement on normalized content, then restore original line endings
+        let mut new_content = if replace_all {
+            normalized_content.replace(&*normalized_old, &*normalized_new)
+        } else {
+            normalized_content.replacen(&*normalized_old, &*normalized_new, 1)
+        };
+        // Restore CRLF if the original file used it
+        if uses_crlf {
+            new_content = new_content.replace("\n", "\r\n");
+        }
+
+        if let Err(e) = std::fs::write(&full, &new_content) {
+            return Ok(ToolOutput::error(format!(
+                "cannot write {}: {}",
+                full.display(), e
+            )));
+        }
 
         let action = if replace_all {
             format!("replaced {} occurrence(s)", count)
@@ -201,7 +249,9 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command. Input: {\"command\": \"...\"}".into(),
+            description: "Run a shell command (uses Git Bash on Windows, sh on Unix). \
+                Always use Unix-style syntax (forward slashes, no backslash escaping). \
+                Input: {\"command\": \"...\"}".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -213,20 +263,26 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let command = input["command"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing 'command'"))?;
+        let command = match input["command"].as_str() {
+            Some(c) => c,
+            None => return Ok(ToolOutput::error("missing required parameter 'command'")),
+        };
 
-        let output = if cfg!(target_os = "windows") {
-            // chcp 65001 forces UTF-8 output from cmd.exe, avoiding GBK mojibake
-            let wrapped = format!("chcp 65001 >nul && {}", command);
-            std::process::Command::new("cmd")
-                .args(["/C", &wrapped])
+        let shell = flint_agent::shell::find_shell();
+        let output = if flint_agent::shell::is_unix_shell(&shell) {
+            // Auto-fix Windows-isms for Unix-style shells:
+            // - %USERPROFILE% → $USERPROFILE (env var syntax)
+            // - D:\path → D:/path (backslash paths)
+            let command = flint_agent::shell::fix_for_unix_shell(command);
+            std::process::Command::new(&shell)
+                .args(["-c", &command])
                 .current_dir(&ctx.working_dir)
                 .output()?
         } else {
-            std::process::Command::new("sh")
-                .args(["-c", command])
+            // cmd.exe fallback (Windows only)
+            let wrapped = format!("chcp 65001 >nul && {}", command);
+            std::process::Command::new("cmd")
+                .args(["/C", &wrapped])
                 .current_dir(&ctx.working_dir)
                 .output()?
         };
@@ -288,7 +344,17 @@ impl Tool for GrepTool {
                     Ok(ToolOutput::text(text.to_string()))
                 }
             }
-            Err(_) => Ok(ToolOutput::error("ripgrep (rg) not found in PATH")),
+            Err(_) => {
+                let hint = if cfg!(target_os = "windows") {
+                    "Install via: winget install BurntSushi.ripgrep.MSVC"
+                } else {
+                    "Install via: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
+                };
+                Ok(ToolOutput::error(format!(
+                    "ripgrep (rg) not found in PATH. {}",
+                    hint
+                )))
+            }
         }
     }
 }
@@ -395,9 +461,14 @@ impl Tool for WebFetchTool {
         };
 
         if text.len() > max_chars {
+            // Safe truncation at char boundary to avoid UTF-8 panic
+            let truncate_at = text.char_indices()
+                .nth(max_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
             Ok(ToolOutput::text(format!(
                 "{}\n\n[truncated — {} chars total]",
-                &text[..max_chars],
+                &text[..truncate_at],
                 text.len()
             )))
         } else {
@@ -724,6 +795,7 @@ impl Tool for MemoryUpdateCoreTool {
 }
 
 // ── Todo ─────────────────────────────────────────────────────────────────────
+
 
 pub struct TodoTool {
     pub store: flint_agent::TodoStore,

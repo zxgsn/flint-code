@@ -276,7 +276,7 @@ impl Tool for SwarmTool {
                     .ok_or_else(|| anyhow::anyhow!("missing 'agent_id'"))?;
 
                 // Check cached result (non-blocking)
-                let (task_id, cached) = {
+                let (_task_id, cached) = {
                     let swarm = self.swarm.lock().unwrap();
                     let tid = swarm.agent_status().iter()
                         .find(|(id, _, _)| id == agent_id)
@@ -382,18 +382,38 @@ impl Tool for SubEditTool {
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}) }
     }
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
-        let path = input["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing required parameter 'path'. Usage: edit(path=\"file.txt\", old_string=\"...\", new_string=\"...\")"))?;
-        let old = input["old_string"].as_str().ok_or_else(|| anyhow::anyhow!("missing required parameter 'old_string'"))?;
-        let new = input["new_string"].as_str().ok_or_else(|| anyhow::anyhow!("missing required parameter 'new_string'"))?;
+        let path = match input["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(ToolOutput::error("missing required parameter 'path'")),
+        };
+        let old = match input["old_string"].as_str() {
+            Some(s) => s,
+            None => return Ok(ToolOutput::error("missing required parameter 'old_string'")),
+        };
+        let new = match input["new_string"].as_str() {
+            Some(s) => s,
+            None => return Ok(ToolOutput::error("missing required parameter 'new_string'")),
+        };
         let all = input["replace_all"].as_bool().unwrap_or(false);
         if old.is_empty() { return Ok(ToolOutput::error("old_string cannot be empty")); }
         let full = ctx.working_dir.join(path);
-        let content = std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{}: {}", full.display(), e))?;
-        let count = content.matches(old).count();
+        let content = match std::fs::read_to_string(&full) {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolOutput::error(format!("{}: {}", full.display(), e))),
+        };
+        // Normalize CRLF for matching (LLM always uses \n)
+        let uses_crlf = content.contains("\r\n");
+        let norm_content = if uses_crlf { content.replace("\r\n", "\n") } else { content.clone() };
+        let norm_old = old.replace("\r\n", "\n");
+        let norm_new = new.replace("\r\n", "\n");
+        let count = norm_content.matches(&*norm_old).count();
         if count == 0 { return Ok(ToolOutput::error(format!("old_string not found in {}", full.display()))); }
         if !all && count > 1 { return Ok(ToolOutput::error(format!("old_string found {} times. Use replace_all=true.", count))); }
-        let new_content = if all { content.replace(old, new) } else { content.replacen(old, new, 1) };
-        std::fs::write(&full, &new_content)?;
+        let mut new_content = if all { norm_content.replace(&*norm_old, &*norm_new) } else { norm_content.replacen(&*norm_old, &*norm_new, 1) };
+        if uses_crlf { new_content = new_content.replace("\n", "\r\n"); }
+        if let Err(e) = std::fs::write(&full, &new_content) {
+            return Ok(ToolOutput::error(format!("cannot write {}: {}", full.display(), e)));
+        }
         Ok(ToolOutput::text(format!("edited {}", full.display())))
     }
 }
@@ -407,11 +427,13 @@ impl Tool for SubBashTool {
     }
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let cmd = input["command"].as_str().ok_or_else(|| anyhow::anyhow!("missing required parameter 'command'. Usage: bash(command=\"ls -la\")"))?;
-        let output = if cfg!(target_os = "windows") {
+        let shell = flint_agent::shell::find_shell();
+        let output = if flint_agent::shell::is_unix_shell(&shell) {
+            let cmd = flint_agent::shell::fix_for_unix_shell(cmd);
+            std::process::Command::new(&shell).args(["-c", &cmd]).current_dir(&ctx.working_dir).output()?
+        } else {
             std::process::Command::new("cmd").args(["/C", &format!("chcp 65001 >nul && {}", cmd)])
                 .current_dir(&ctx.working_dir).output()?
-        } else {
-            std::process::Command::new("sh").args(["-c", cmd]).current_dir(&ctx.working_dir).output()?
         };
         let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         if output.status.success() { Ok(ToolOutput::text(combined)) }
@@ -435,7 +457,17 @@ impl Tool for SubGrepTool {
                 let text = String::from_utf8_lossy(&o.stdout);
                 Ok(ToolOutput::text(if text.is_empty() { "no matches found".into() } else { text.to_string() }))
             }
-            Err(_) => Ok(ToolOutput::error("ripgrep (rg) not found in PATH")),
+            Err(_) => {
+                let hint = if cfg!(target_os = "windows") {
+                    "Install via: winget install BurntSushi.ripgrep.MSVC"
+                } else {
+                    "Install via: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
+                };
+                Ok(ToolOutput::error(format!(
+                    "ripgrep (rg) not found in PATH. {}",
+                    hint
+                )))
+            }
         }
     }
 }

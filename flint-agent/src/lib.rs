@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod checkpoint;
 pub mod session;
+pub mod shell;
 pub mod todo;
 pub mod tool;
 

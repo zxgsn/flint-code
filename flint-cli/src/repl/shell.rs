@@ -10,17 +10,16 @@ pub fn execute(cmd: &str, working_dir: &Path) -> bool {
         println!("Usage: !<command>  (e.g. !ls, !git status)\n");
         return true;
     }
-    let (shell, flag, wrapped_cmd);
-    if cfg!(target_os = "windows") {
-        shell = "cmd";
-        flag = "/C";
-        wrapped_cmd = format!("chcp 65001 >nul && {}", cmd);
-    } else {
-        shell = "sh";
+    let shell = flint_agent::shell::find_shell();
+    let (flag, wrapped_cmd);
+    if flint_agent::shell::is_unix_shell(&shell) {
         flag = "-c";
         wrapped_cmd = cmd.to_string();
+    } else {
+        flag = "/C";
+        wrapped_cmd = format!("chcp 65001 >nul && {}", cmd);
     }
-    let output = std::process::Command::new(shell)
+    let output = std::process::Command::new(&shell)
         .args([flag, &wrapped_cmd])
         .current_dir(working_dir)
         .output();

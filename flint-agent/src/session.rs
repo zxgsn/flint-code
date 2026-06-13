@@ -28,12 +28,18 @@ struct SessionFile {
 /// A conversation session holding message history.
 pub struct Session {
     pub messages: Vec<Message>,
+    /// Circuit breaker: tracks consecutive errors from the same tool across turns.
+    pub circuit_breaker_last_tool: Option<String>,
+    /// Circuit breaker: count of consecutive errors from the same tool.
+    pub circuit_breaker_count: u32,
 }
 
 impl Session {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            circuit_breaker_last_tool: None,
+            circuit_breaker_count: 0,
         }
     }
 
@@ -108,6 +114,8 @@ impl Session {
         let file: SessionFile = serde_json::from_str(&json)?;
         let session = Self {
             messages: file.messages,
+            circuit_breaker_last_tool: None,
+            circuit_breaker_count: 0,
         };
         Ok((session, file.meta))
     }

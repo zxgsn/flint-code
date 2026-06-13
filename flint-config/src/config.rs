@@ -248,10 +248,15 @@ fn merge_file(config: &mut Config, path: &Path) -> anyhow::Result<()> {
 }
 
 fn merge_provider(target: &mut crate::config::ProviderConfig, source: &crate::config::ProviderConfig) {
-    // Always merge provider config from file, even if values match defaults
-    // This ensures user's explicit config is respected
-    target.r#type = source.r#type.clone();
-    target.model = source.model.clone();
+    // Only override type/model if source explicitly set them (differs from serde default)
+    // This prevents serde defaults in a project-level config from overwriting
+    // a user-level config that explicitly set a different value.
+    if source.r#type != default_provider_type() {
+        target.r#type = source.r#type.clone();
+    }
+    if source.model != default_model() {
+        target.model = source.model.clone();
+    }
     // Merge recent_models additively (dedup, preserve order)
     for m in &source.recent_models {
         if !target.recent_models.contains(m) {
@@ -319,11 +324,11 @@ fn default_model() -> String {
 }
 
 fn default_max_turns() -> u32 {
-    50
+    100
 }
 
 fn default_max_output_chars() -> usize {
-    65536
+    131072 // 128KB
 }
 
 fn default_context_window_chars() -> usize {
