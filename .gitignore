@@ -5,3 +5,5 @@
 # Test / analysis files (not part of the project)
 analysis_*.md
 test-*.js
+models.json
+test_api.ps1
