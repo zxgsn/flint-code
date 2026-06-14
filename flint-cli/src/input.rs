@@ -4,7 +4,10 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
@@ -236,7 +239,10 @@ fn get_path_completions(partial: &str, working_dir: &std::path::Path) -> Vec<Str
 /// Read a line from the terminal using crossterm raw mode.
 pub fn read_line() -> Result<InputResult> {
     enable_raw_mode()?;
-    let result = read_line_inner(|| {});
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnableBracketedPaste)?;
+    let result = read_line_inner(|| {}, "");
+    execute!(stdout, DisableBracketedPaste)?;
     disable_raw_mode()?;
     println!();
     result
@@ -247,7 +253,22 @@ pub fn read_line() -> Result<InputResult> {
 /// This allows processing input requests from sub-agents without blocking.
 pub fn read_line_with_handler<F: FnMut()>(handler: F) -> Result<InputResult> {
     enable_raw_mode()?;
-    let result = read_line_inner(handler);
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnableBracketedPaste)?;
+    let result = read_line_inner(handler, "");
+    execute!(stdout, DisableBracketedPaste)?;
+    disable_raw_mode()?;
+    println!();
+    result
+}
+
+/// Read a line with pre-filled initial text (for type-ahead review).
+pub fn read_line_prefilled(initial: &str) -> Result<InputResult> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnableBracketedPaste)?;
+    let result = read_line_inner(|| {}, initial);
+    execute!(stdout, DisableBracketedPaste)?;
     disable_raw_mode()?;
     println!();
     result
@@ -255,9 +276,9 @@ pub fn read_line_with_handler<F: FnMut()>(handler: F) -> Result<InputResult> {
 
 // ── Core input loop ────────────────────────────────────────────────────────
 
-fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
-    let mut buf = String::new();
-    let mut cursor_pos: usize = 0;
+fn read_line_inner<F: FnMut()>(mut handler: F, initial: &str) -> Result<InputResult> {
+    let mut buf = initial.to_string();
+    let mut cursor_pos: usize = buf.len();
     let mut ctrl_c_count: u8 = 0;
     let mut completion_lines: u16 = 0;
     let mut tab_index: usize = 0;
@@ -266,11 +287,22 @@ fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
     // Normal typing has pauses (arrows, tab, etc. reset this).
     // Pasting sends many chars without interruption.
     let mut rapid_char_count: u32 = 0;
+    // Track if we're in paste mode (received bracketed paste recently)
+    let mut in_paste_mode = false;
+    let mut paste_mode_timeout: Option<std::time::Instant> = None;
 
     // Record the input row once at the start
     let (_, mut start_row) = crossterm::cursor::position()?;
 
     loop {
+        // Check paste mode timeout (exit after 2 seconds of no paste activity)
+        if let Some(timeout) = paste_mode_timeout {
+            if timeout.elapsed().as_secs() > 2 {
+                in_paste_mode = false;
+                paste_mode_timeout = None;
+            }
+        }
+
         // Poll with 100ms timeout instead of blocking event::read().
         // This lets us run the handler periodically to process input requests.
         if !event::poll(std::time::Duration::from_millis(100))? {
@@ -278,10 +310,37 @@ fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
             handler();
             continue;
         }
-        if let Event::Key(KeyEvent {
-            code, modifiers, kind, ..
-        }) = event::read()?
-        {
+        match event::read()? {
+            // Bracketed paste — terminal wraps pasted content in escape sequences,
+            // so we receive it as a single event instead of character-by-character.
+            Event::Paste(pasted) => {
+                if pasted.is_empty() {
+                    continue;
+                }
+                // Enter paste mode — subsequent Enter keys should insert newlines
+                in_paste_mode = true;
+                paste_mode_timeout = Some(std::time::Instant::now());
+                undo_stack.push((buf.clone(), cursor_pos));
+                if !buf.is_char_boundary(cursor_pos) {
+                    cursor_pos = buf.len();
+                }
+                // If the pasted content contains newlines, handle them properly
+                if pasted.contains('\n') || pasted.contains('\r') {
+                    // Normalize line endings
+                    let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    buf.insert_str(cursor_pos, &normalized);
+                    cursor_pos += normalized.len();
+                } else {
+                    buf.insert_str(cursor_pos, &pasted);
+                    cursor_pos += pasted.len();
+                }
+                tab_index = 0;
+                rapid_char_count = 0;
+                render_input_and_completions(&buf, cursor_pos, &mut completion_lines, start_row)?;
+            }
+            Event::Key(KeyEvent {
+                code, modifiers, kind, ..
+            }) => {
             if kind != event::KeyEventKind::Press {
                 continue;
             }
@@ -334,8 +393,18 @@ fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
                 }
                 // Enter — submit (or insert newline in paste mode)
                 (KeyCode::Enter, _) => {
-                    let is_paste = rapid_char_count > 10;
+                    // Check if we're in paste mode (recent bracketed paste or rapid chars)
+                    let is_paste = in_paste_mode || rapid_char_count > 10;
                     rapid_char_count = 0;
+
+                    // Exit paste mode after a short timeout (2 seconds)
+                    if let Some(timeout) = paste_mode_timeout {
+                        if timeout.elapsed().as_secs() > 2 {
+                            in_paste_mode = false;
+                            paste_mode_timeout = None;
+                        }
+                    }
+
                     if is_paste {
                         // Pasted content with newlines: insert literally
                         undo_stack.push((buf.clone(), cursor_pos));
@@ -500,6 +569,11 @@ fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
                 (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
                     rapid_char_count += 1;
 
+                    // If we haven't received a bracketed paste recently, exit paste mode
+                    if paste_mode_timeout.is_none() {
+                        in_paste_mode = false;
+                    }
+
                     // Ensure cursor_pos is at a valid char boundary
                     if !buf.is_char_boundary(cursor_pos) {
                         cursor_pos = buf.len();
@@ -530,6 +604,8 @@ fn read_line_inner<F: FnMut()>(mut handler: F) -> Result<InputResult> {
                 }
                 _ => {}
             }
+            }
+            _ => {}
         }
     }
 }

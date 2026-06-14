@@ -13,6 +13,7 @@ mod resume_ui;
 pub mod session_import;
 mod setup_ui;
 mod tools;
+mod typeahead;
 
 use anyhow::Result;
 use clap::Parser;

@@ -16,29 +16,117 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::prompt;
+use crate::typeahead;
 
-/// Run the interactive REPL loop.
-pub async fn run(
-    mut config: flint_config::Config,
-    mut prov: Arc<dyn Provider>,
-    mut session: Session,
-    mut registry: ToolRegistry,
+/// Result of executing a turn.
+enum TurnOutcome {
+    Success { text: String, tool_calls: u32 },
+    Error(String),
+}
+
+/// Execute a single LLM turn with the given input.
+///
+/// This is the core turn execution pattern used by:
+/// - Initial message handling
+/// - Pending coordinator message handling
+/// - Sub-agent result processing
+/// - Normal user input
+/// - Auto-poke continuation
+async fn execute_turn(
+    prov: &dyn Provider,
+    session: &mut Session,
+    registry: &ToolRegistry,
     system: &str,
     ctx: &ToolContext,
-    cancel: Arc<AtomicBool>,
-    mut mcp_manager: McpManager,
+    config: &flint_config::Config,
+    cancel: &Arc<AtomicBool>,
+    swarm_notify_shared: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+) -> TurnOutcome {
+    let render_line = |line: &str| {
+        crate::repl::render::render_markdown_line_to_stdout(line);
+    };
+
+    // Set up turn callback for real-time notification draining
+    let cb_notify = swarm_notify_shared.clone();
+    let cb_swarm = swarm.clone();
+    let turn_callback: flint_agent::EventCallback = Box::new(move |_event| {
+        drain_and_display_notifications_sync(&cb_notify, &cb_swarm);
+        drain_and_display_streams_sync(&cb_swarm);
+        true
+    });
+
+    match run_turn(
+        prov,
+        session,
+        registry,
+        system,
+        ctx,
+        config.agent.max_turns,
+        Some(cancel.clone()),
+        config.agent.max_output_chars,
+        false,
+        Some(&turn_callback),
+        Some(&render_line),
+    )
+    .await
+    {
+        Ok((_text, stats)) => TurnOutcome::Success {
+            text: _text,
+            tool_calls: stats.tool_calls,
+        },
+        Err(e) => TurnOutcome::Error(e.to_string()),
+    }
+}
+
+/// Check if the session needs compaction and compact if necessary.
+/// Returns true if compaction was performed.
+async fn maybe_compact(
+    session: &mut Session,
+    current_session_meta: &mut Option<flint_agent::SessionMeta>,
+    prov: &dyn Provider,
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    config: &flint_config::Config,
+) -> bool {
+    if !config.features.is_enabled(Feature::Compaction) {
+        return false;
+    }
+
+    let total_chars: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
+    let threshold = (config.agent.context_window_chars as f64 * 0.8) as usize;
+
+    if total_chars <= threshold || session.messages.len() <= 6 {
+        return false;
+    }
+
+    eprintln!(
+        "\x1b[90m  auto-compact: {} chars exceeds {} threshold\x1b[0m",
+        total_chars, threshold
+    );
+
+    let pre_compact_count = session.messages.len();
+    dispatch_auto_compact(session, current_session_meta, prov, registry, ctx).await;
+
+    // Save immediately after compaction
+    if session.messages.len() < pre_compact_count {
+        if let Some(meta) = save_session(session, current_session_meta, config) {
+            *current_session_meta = Some(meta);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Print the startup banner with version, provider, and feature info.
+fn print_startup_banner(
+    config: &flint_config::Config,
     working_dir: &Path,
-    mut memory: Option<Arc<Mutex<flint_memory::MemoryManager>>>,
-    mut swarm: Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
-    swarm_notify: Option<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>,
-    mut auto_poke: Option<auto_poke::AutoPoke>,
-    checkpoint_store: flint_agent::CheckpointStore,
-    turn_counter: Arc<std::sync::atomic::AtomicU32>,
-    initial_message: Option<String>,
-    message_file: Option<String>,
-    router_addr: Option<String>,
-    agent_id: Option<String>,
-) -> Result<()> {
+    memory: &Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    auto_poke: &Option<auto_poke::AutoPoke>,
+) {
     println!(
         "flint v{} -- {} / {}",
         env!("CARGO_PKG_VERSION"),
@@ -77,8 +165,179 @@ pub async fn run(
         println!("Auto-poke: enabled (todo tool active) -- /poke to toggle");
     }
     println!("Checkpoints: enabled (file snapshots per turn) -- /undo to revert");
-
     println!();
+}
+
+/// Process type-ahead input after agent execution completes.
+/// This handles the buffered input as if the user typed it at the prompt.
+async fn process_typeahead_input(
+    input: &str,
+    session: &mut Session,
+    current_session_meta: &mut Option<flint_agent::SessionMeta>,
+    prov: &Arc<dyn Provider>,
+    registry: &ToolRegistry,
+    turn_count: &mut u32,
+    turn_counter: &Arc<std::sync::atomic::AtomicU32>,
+    checkpoint_store: &flint_agent::CheckpointStore,
+    ctx: &ToolContext,
+    config: &flint_config::Config,
+    cancel: &Arc<AtomicBool>,
+    swarm_notify_shared: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    auto_poke: &mut Option<auto_poke::AutoPoke>,
+    memory: &Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    sub_agent_mode: bool,
+    result_delivered: &mut bool,
+    router_endpoint: &mut Option<flint_swarm::endpoint::AgentEndpoint>,
+    working_dir: &Path,
+) {
+    // Shell commands
+    if input.starts_with('!') {
+        crate::repl::shell::execute(&input[1..], working_dir);
+        return;
+    }
+
+    // Slash commands
+    if input.starts_with('/') {
+        // For type-ahead, we just print a message - user should use normal prompt
+        eprintln!("\x1b[90m  [slash commands not supported in auto-submitted type-ahead]\x1b[0m");
+        return;
+    }
+
+    // Normal LLM message
+    *turn_count += 1;
+    turn_counter.store(*turn_count, std::sync::atomic::Ordering::Relaxed);
+
+    flint_agent::checkpoint::set_session_msg_count(
+        checkpoint_store, *turn_count, session.messages.len(),
+    );
+
+    let effective_system = crate::prompt::build_system_prompt(
+        &config.agent.system_prompt.clone().unwrap_or_default(),
+        config,
+        working_dir,
+    );
+
+    // Search for matching skill
+    let skill_prompt = config.load_skill_metas(Some(working_dir)).iter()
+        .find(|s| s.name != "init" && input.to_lowercase().starts_with(&s.name.to_lowercase()))
+        .and_then(|m| config.load_skill_by_name(&m.name, Some(working_dir)))
+        .map(|s| s.prompt);
+
+    let mut enhanced_input = String::new();
+    if let Some(ref skill) = skill_prompt {
+        enhanced_input.push_str(skill);
+        enhanced_input.push_str("\n\n");
+    }
+
+    // Search memory for relevant context
+    if config.features.is_enabled(Feature::Memory) {
+        if let Some(ref mem) = memory {
+            let mut mem_guard = mem.lock().unwrap();
+            let results = mem_guard.search(input, None, Some(3));
+            if !results.is_empty() {
+                enhanced_input.push_str("[Relevant memories]\n");
+                for r in &results {
+                    enhanced_input.push_str(&format!("- {}\n", r.entry.content));
+                }
+                enhanced_input.push('\n');
+            }
+        }
+    }
+
+    enhanced_input.push_str(input);
+    session.add_user(&enhanced_input);
+
+    cancel.store(false, Ordering::Relaxed);
+
+    let cb_notify = swarm_notify_shared.clone();
+    let cb_swarm = swarm.clone();
+    let turn_callback: flint_agent::EventCallback = Box::new(move |_event| {
+        drain_and_display_notifications_sync(&cb_notify, &cb_swarm);
+        drain_and_display_streams_sync(&cb_swarm);
+        true
+    });
+
+    let render_line = |line: &str| {
+        crate::repl::render::render_markdown_line_to_stdout(line);
+    };
+
+    let pre_turn_msg_count = session.messages.len();
+
+    match run_turn(
+        prov.as_ref(),
+        session,
+        registry,
+        &effective_system,
+        ctx,
+        config.agent.max_turns,
+        Some(cancel.clone()),
+        config.agent.max_output_chars,
+        false,
+        Some(&turn_callback),
+        Some(&render_line),
+    )
+    .await
+    {
+        Ok((_text, stats)) => {
+            // Auto-extract memories
+            if config.features.memory.auto_extract {
+                if let Some(ref mem) = memory {
+                    spawn_auto_extract(
+                        Arc::clone(mem),
+                        session.messages.clone(),
+                        pre_turn_msg_count,
+                        Arc::clone(prov),
+                        registry.clone(),
+                        ctx.clone(),
+                    );
+                }
+            }
+
+            // Sub-agent task completion
+            if sub_agent_mode && !*result_delivered {
+                let last_text = session.messages.iter().rev()
+                    .find(|m| m.role == flint_types::Role::Assistant)
+                    .map(|m| m.text())
+                    .unwrap_or_default();
+                if last_text.contains("[TASK_COMPLETE]") {
+                    let result = last_text.replace("[TASK_COMPLETE]", "").trim().to_string();
+                    deliver_sub_agent_result(&result, router_endpoint, working_dir).await;
+                    *result_delivered = true;
+                    eprintln!("\n\x1b[32m  [task complete] Result delivered.\x1b[0m");
+                    eprintln!("\x1b[90m  Waiting for follow-up tasks...\x1b[0m");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e);
+        }
+    }
+}
+
+/// Run the interactive REPL loop.
+pub async fn run(
+    mut config: flint_config::Config,
+    mut prov: Arc<dyn Provider>,
+    mut session: Session,
+    mut registry: ToolRegistry,
+    system: &str,
+    ctx: &ToolContext,
+    cancel: Arc<AtomicBool>,
+    mut mcp_manager: McpManager,
+    working_dir: &Path,
+    mut memory: Option<Arc<Mutex<flint_memory::MemoryManager>>>,
+    mut swarm: Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+    swarm_notify: Option<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>,
+    mut auto_poke: Option<auto_poke::AutoPoke>,
+    checkpoint_store: flint_agent::CheckpointStore,
+    turn_counter: Arc<std::sync::atomic::AtomicU32>,
+    initial_message: Option<String>,
+    message_file: Option<String>,
+    router_addr: Option<String>,
+    agent_id: Option<String>,
+) -> Result<()> {
+    print_startup_banner(&config, working_dir, &memory, &swarm, &auto_poke);
 
     let mut current_session_meta: Option<flint_agent::SessionMeta> = None;
     let mut turn_count: u32 = 0;
@@ -144,26 +403,14 @@ pub async fn run(
         );
 
         let effective_system = system.to_string();
-        let render_line = |line: &str| {
-            crate::repl::render::render_markdown_line_to_stdout(line);
-        };
-        match run_turn(
-            prov.as_ref(),
-            &mut session,
-            &registry,
-            &effective_system,
-            ctx,
-            config.agent.max_turns,
-            Some(cancel.clone()),
-            config.agent.max_output_chars,
-            false,
-            None,
-            Some(&render_line),
-        )
-        .await
-        {
-            Ok((_text, stats)) => {
-                total_tool_calls += stats.tool_calls;
+        let outcome = execute_turn(
+            prov.as_ref(), &mut session, &registry, &effective_system, ctx,
+            &config, &cancel, &swarm_notify_shared, &swarm,
+        ).await;
+
+        match outcome {
+            TurnOutcome::Success { tool_calls, .. } => {
+                total_tool_calls += tool_calls;
 
                 // Sub-agent: check for [TASK_COMPLETE] in initial message response
                 if sub_agent_mode {
@@ -180,7 +427,7 @@ pub async fn run(
                     }
                 }
             }
-            Err(e) => {
+            TurnOutcome::Error(e) => {
                 eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e);
             }
         }
@@ -234,16 +481,12 @@ pub async fn run(
                 &checkpoint_store, turn_count, session.messages.len(),
             );
             let effective_system = system.to_string();
-            let render_line = |line: &str| {
-                crate::repl::render::render_markdown_line_to_stdout(line);
-            };
-            match run_turn(
+            let outcome = execute_turn(
                 prov.as_ref(), &mut session, &registry, &effective_system, ctx,
-                config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
-                false, None, Some(&render_line),
-            ).await {
-                Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
-                Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
+                &config, &cancel, &swarm_notify_shared, &swarm,
+            ).await;
+            if let TurnOutcome::Success { tool_calls, .. } = outcome {
+                total_tool_calls += tool_calls;
             }
             println!();
         }
@@ -375,16 +618,12 @@ pub async fn run(
                     &checkpoint_store, turn_count, session.messages.len(),
                 );
                 let effective_system = system.to_string();
-                let render_line = |line: &str| {
-                    crate::repl::render::render_markdown_line_to_stdout(line);
-                };
-                match run_turn(
+                let outcome = execute_turn(
                     prov.as_ref(), &mut session, &registry, &effective_system, ctx,
-                    config.agent.max_turns, Some(cancel.clone()), config.agent.max_output_chars,
-                    false, None, Some(&render_line),
-                ).await {
-                    Ok((_text, stats)) => { total_tool_calls += stats.tool_calls; }
-                    Err(e) => { eprintln!("\n\x1b[31m! Error:\x1b[0m {}", e); }
+                    &config, &cancel, &swarm_notify_shared, &swarm,
+                ).await;
+                if let TurnOutcome::Success { tool_calls, .. } = outcome {
+                    total_tool_calls += tool_calls;
                 }
                 println!();
             }
@@ -427,6 +666,7 @@ pub async fn run(
                 auto_poke: &mut auto_poke,
                 checkpoint_store: checkpoint_store.clone(),
                 _turn_counter: turn_counter.clone(),
+                arg: None,
                 system,
                 turn_count,
                 total_tool_calls,
@@ -489,33 +729,7 @@ pub async fn run(
         cancel.store(false, Ordering::Relaxed);
 
         // Pre-send compaction: compact BEFORE the API call if session is too large.
-        // This prevents context_length_exceeded errors from the API.
-        if config.features.is_enabled(Feature::Compaction) {
-            let total_chars: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
-            let threshold = (config.agent.context_window_chars as f64 * 0.8) as usize;
-            if total_chars > threshold && session.messages.len() > 6 {
-                eprintln!(
-                    "\x1b[90m  pre-send compact: {} chars exceeds {} threshold\x1b[0m",
-                    total_chars, threshold
-                );
-                let pre_compact_count = session.messages.len();
-                dispatch_auto_compact(
-                    &mut session,
-                    &mut current_session_meta,
-                    &*prov,
-                    &registry,
-                    ctx,
-                )
-                .await;
-                // Save immediately after compaction so the compacted state
-                // is persisted even if the turn fails or user exits.
-                if session.messages.len() < pre_compact_count {
-                    if let Some(meta) = save_session(&session, &current_session_meta, &config) {
-                        current_session_meta = Some(meta);
-                    }
-                }
-            }
-        }
+        maybe_compact(&mut session, &mut current_session_meta, &*prov, &registry, ctx, &config).await;
 
         // Remember the last assistant message index for extraction
         let pre_turn_msg_count = session.messages.len();
@@ -533,6 +747,14 @@ pub async fn run(
         let render_line = |line: &str| {
             crate::repl::render::render_markdown_line_to_stdout(line);
         };
+
+        // Spawn typeahead reader thread to capture input during agent execution
+        let typeahead_buf = Arc::new(Mutex::new(typeahead::TypeaheadBuffer::new()));
+        let (typeahead_handle, typeahead_stop) = typeahead::spawn_typeahead_reader(
+            typeahead_buf.clone(),
+            cancel.clone(),
+        );
+
         match run_turn(
             prov.as_ref(),
             &mut session,
@@ -581,6 +803,30 @@ pub async fn run(
                         eprintln!("\n\x1b[32m  [task complete] Result delivered.\x1b[0m");
                         eprintln!("\x1b[90m  Waiting for follow-up tasks...\x1b[0m");
                     }
+                }
+
+                // ── Inject sub-agent notifications into session ──────────
+                // After each turn, drain any pending notifications and inject
+                // them as system messages so the main agent knows about
+                // sub-agent completions and failures.
+                let notifications = drain_and_display_notifications(&swarm_notify_shared, &swarm);
+                for notif in &notifications {
+                    let short_id = notif.agent_id.strip_prefix("agent_").unwrap_or(&notif.agent_id);
+                    let short_id = &short_id[..4.min(short_id.len())];
+                    let short_task = &notif.task_id[..8.min(notif.task_id.len())];
+                    let msg = match &notif.result {
+                        Ok(text) => {
+                            format!("[Sub-agent {} completed task {}]\n{}", short_id, short_task, text)
+                        }
+                        Err(e) => {
+                            format!(
+                                "[Sub-agent {} FAILED task {}]\nError: {}\n\n\
+                                 You should handle this task yourself or spawn a new agent to retry.",
+                                short_id, short_task, e
+                            )
+                        }
+                    };
+                    session.messages.push(flint_types::Message::system(&msg));
                 }
 
                 // ── Auto-poke: keep going if incomplete todos remain ──────
@@ -650,6 +896,91 @@ pub async fn run(
             }
         }
 
+        // Stop typeahead reader thread and process buffered input
+        typeahead_stop.store(true, Ordering::Relaxed);
+        let _ = typeahead_handle.join();
+
+        {
+            let buf = typeahead_buf.lock().unwrap();
+            if buf.is_cancelled() {
+                // User pressed Ctrl+C during execution - buffer discarded
+                eprintln!();
+            } else if !buf.is_empty() {
+                let buffered_text = buf.text().to_string();
+                let was_submitted = buf.is_submitted();
+                drop(buf);
+
+                if was_submitted {
+                    // Auto-submit: user pressed Enter, process directly
+                    eprintln!();
+                    eprintln!("\x1b[90m  ── type-ahead input (auto-submitted) ──\x1b[0m");
+                    let input = buffered_text.trim().to_string();
+                    if !input.is_empty() {
+                        // Process the buffered input as a new turn
+                        process_typeahead_input(
+                            &input,
+                            &mut session,
+                            &mut current_session_meta,
+                            &prov,
+                            &registry,
+                            &mut turn_count,
+                            &turn_counter,
+                            &checkpoint_store,
+                            ctx,
+                            &config,
+                            &cancel,
+                            &swarm_notify_shared,
+                            &swarm,
+                            &mut auto_poke,
+                            &memory,
+                            sub_agent_mode,
+                            &mut result_delivered,
+                            &mut router_endpoint,
+                            working_dir,
+                        ).await;
+                    }
+                } else {
+                    // Present for review: let user edit before submitting
+                    eprintln!();
+                    eprintln!("\x1b[90m  ── type-ahead input (edit and press Enter to submit) ──\x1b[0m");
+                    print!("❯ ");
+                    std::io::stdout().flush()?;
+                    match crate::input::read_line_prefilled(&buffered_text) {
+                        Ok(crate::input::InputResult::Line(line)) => {
+                            let input = line.trim().to_string();
+                            if !input.is_empty() {
+                                process_typeahead_input(
+                                    &input,
+                                    &mut session,
+                                    &mut current_session_meta,
+                                    &prov,
+                                    &registry,
+                                    &mut turn_count,
+                                    &turn_counter,
+                                    &checkpoint_store,
+                                    ctx,
+                                    &config,
+                                    &cancel,
+                                    &swarm_notify_shared,
+                                    &swarm,
+                                    &mut auto_poke,
+                                    &memory,
+                                    sub_agent_mode,
+                                    &mut result_delivered,
+                                    &mut router_endpoint,
+                                    working_dir,
+                                ).await;
+                            }
+                        }
+                        Ok(crate::input::InputResult::Exit) => {
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
         // Drain sub-agent completion notifications and display to user
         drain_and_display_notifications(
             &swarm_notify_shared,
@@ -701,31 +1032,7 @@ pub async fn run(
         }
 
         // Auto-compaction: if session exceeds 80% of context window, compact automatically
-        if config.features.is_enabled(Feature::Compaction) {
-            let total_chars: usize = session.messages.iter().map(|m| m.estimated_chars()).sum();
-            let threshold = (config.agent.context_window_chars as f64 * 0.8) as usize;
-            if total_chars > threshold && session.messages.len() > 6 {
-                eprintln!(
-                    "\x1b[90m  auto-compact: {} chars exceeds {} threshold\x1b[0m",
-                    total_chars, threshold
-                );
-                let pre_compact_count = session.messages.len();
-                dispatch_auto_compact(
-                    &mut session,
-                    &mut current_session_meta,
-                    &*prov,
-                    &registry,
-                    ctx,
-                )
-                .await;
-                // Save immediately after compaction
-                if session.messages.len() < pre_compact_count {
-                    if let Some(meta) = save_session(&session, &current_session_meta, &config) {
-                        current_session_meta = Some(meta);
-                    }
-                }
-            }
-        }
+        maybe_compact(&mut session, &mut current_session_meta, &*prov, &registry, ctx, &config).await;
 
         // Auto-save session
         if let Some(meta) = save_session(&session, &current_session_meta, &config) {
@@ -1249,7 +1556,7 @@ fn perform_undo(
 fn drain_and_display_notifications(
     notify_shared: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>>,
     swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
-) {
+) -> Vec<flint_swarm::AgentNotification> {
     let notifications: Vec<flint_swarm::AgentNotification> = if let Some(ref rx) = notify_shared {
         let mut rx = rx.lock().unwrap();
         let mut notifs = Vec::new();
@@ -1258,7 +1565,7 @@ fn drain_and_display_notifications(
         }
         notifs
     } else {
-        return;
+        return Vec::new();
     };
 
     for notif in &notifications {
@@ -1297,6 +1604,8 @@ fn drain_and_display_notifications(
             }
         }
     }
+
+    notifications
 }
 
 /// Same as drain_and_display_notifications but usable inside a Fn callback
