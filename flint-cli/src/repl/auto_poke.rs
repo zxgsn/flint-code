@@ -26,6 +26,8 @@ pub struct AutoPoke {
     pub max_pokes: u32,
     /// The todo store shared with the TodoTool.
     pub store: TodoStore,
+    /// Whether swarm is enabled — controls parallel suggestions.
+    pub swarm_enabled: bool,
 }
 
 impl AutoPoke {
@@ -35,6 +37,7 @@ impl AutoPoke {
             consecutive_pokes: 0,
             max_pokes: DEFAULT_MAX_POKES,
             store,
+            swarm_enabled: false,
         }
     }
 
@@ -51,9 +54,11 @@ impl AutoPoke {
         }
 
         let todos = flint_agent::todo::incomplete_todos(&self.store);
+
+        // All todos done — check confidence and disarm
         if todos.is_empty() {
-            // All done — no poke needed
-            return None;
+            self.enabled = false;
+            return self.build_confidence_summary();
         }
 
         if self.consecutive_pokes >= self.max_pokes {
@@ -68,11 +73,25 @@ impl AutoPoke {
 
         self.consecutive_pokes += 1;
         let incomplete = todos.len();
-        // Include actual todo titles so the agent knows what to work on
+
+        // Check for parallelizable todos (no dependencies, not assigned)
+        let parallelizable = flint_agent::todo::parallelizable_todos(&self.store);
+        let can_parallelize = self.swarm_enabled && parallelizable.len() >= 2;
+
+        // Format todo list
         let todo_list: String = todos
             .iter()
             .take(5)
-            .map(|t| format!("  #{} [{}] {}", t.id, format!("{:?}", t.status).to_lowercase(), t.title))
+            .map(|t| {
+                let mut info = format!("  #{} [{}] {}", t.id, format!("{:?}", t.status).to_lowercase(), t.title);
+                if let Some(c) = t.confidence {
+                    info.push_str(&format!(" (conf={})", c));
+                }
+                if !t.blocked_by.is_empty() {
+                    info.push_str(&format!(" (blocked by {:?})", t.blocked_by));
+                }
+                info
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let more = if incomplete > 5 {
@@ -80,14 +99,93 @@ impl AutoPoke {
         } else {
             String::new()
         };
-        Some(format!(
-            "You have {} incomplete todo{}. Continue working:\n{}{}\n\n\
-             Use the todo tool to update status as you complete each item.",
-            incomplete,
-            if incomplete == 1 { "" } else { "s" },
-            todo_list,
-            more,
-        ))
+
+        // Build poke message with optional parallel suggestion
+        if can_parallelize {
+            let parallel_list: String = parallelizable
+                .iter()
+                .take(5)
+                .map(|t| format!("  #{} {}", t.id, t.title))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!(
+                "You have {} incomplete todo{}. {} can run in parallel:\n{}\n\n\
+                 Consider using `swarm spawn` for independent tasks, \
+                 or continue sequentially:\n{}{}\n\n\
+                 Use the todo tool to update status as you complete each item.",
+                incomplete,
+                if incomplete == 1 { "" } else { "s" },
+                parallelizable.len(),
+                parallel_list,
+                todo_list,
+                more,
+            ))
+        } else {
+            Some(format!(
+                "You have {} incomplete todo{}. Continue working:\n{}{}\n\n\
+                 Use the todo tool to update status as you complete each item.",
+                incomplete,
+                if incomplete == 1 { "" } else { "s" },
+                todo_list,
+                more,
+            ))
+        }
+    }
+
+    /// Build a confidence summary message when all todos are complete.
+    /// Returns None if confidence is sufficient or no todos exist.
+    fn build_confidence_summary(&self) -> Option<String> {
+        let summary = flint_agent::todo::weighted_completion_confidence(&self.store);
+
+        if summary.completed == 0 {
+            return None;
+        }
+
+        eprintln!(
+            "\x1b[90m  [auto-poke] all done: {}/{} completed, weighted confidence: {}%\x1b[0m",
+            summary.completed, summary.total, summary.weighted_avg
+        );
+
+        if summary.weighted_avg >= flint_agent::todo::CONFIDENCE_THRESHOLD {
+            // Confidence is sufficient — stop cleanly
+            eprintln!("\x1b[32m  [auto-poke] confidence above threshold ({}%)\x1b[0m",
+                flint_agent::todo::CONFIDENCE_THRESHOLD);
+            return None;
+        }
+
+        // Confidence below threshold — send validation prompt
+        let mut msg = format!(
+            "All {} todos completed. Weighted confidence: {}% (threshold: {}%).",
+            summary.completed,
+            summary.weighted_avg,
+            flint_agent::todo::CONFIDENCE_THRESHOLD
+        );
+
+        if summary.below_threshold > 0 {
+            msg.push_str(&format!(
+                "\n{} todo(s) below threshold.",
+                summary.below_threshold
+            ));
+        }
+
+        if summary.missing_confidence > 0 {
+            msg.push_str(&format!(
+                "\n{} todo(s) missing completion_confidence.",
+                summary.missing_confidence
+            ));
+        }
+
+        if let Some(lowest) = summary.lowest_confidence {
+            msg.push_str(&format!("\nLowest confidence: {}%.", lowest));
+        }
+
+        msg.push_str(
+            "\n\nConsider validating before finalizing. If you are confident \
+             everything is correct, you may stop. Otherwise, review the work \
+             and run additional tests."
+        );
+
+        Some(msg)
     }
 
     /// Check if an error message indicates a non-retryable failure.

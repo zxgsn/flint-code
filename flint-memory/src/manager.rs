@@ -46,7 +46,7 @@ pub struct MemoryManager {
     project_store: Option<MemoryStore>,
     global_store: MemoryStore,
     config: MemoryConfig,
-    project_dir: Option<PathBuf>,
+    _project_dir: Option<PathBuf>,
 }
 
 impl MemoryManager {
@@ -70,7 +70,7 @@ impl MemoryManager {
             project_store,
             global_store,
             config,
-            project_dir: project_dir.map(|p| p.to_path_buf()),
+            _project_dir: project_dir.map(|p| p.to_path_buf()),
         })
     }
 

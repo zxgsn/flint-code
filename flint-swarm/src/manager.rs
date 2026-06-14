@@ -7,12 +7,85 @@ use crate::agent::{AgentRequest, InputRequest, InputResponse};
 use crate::log;
 use crate::output::OutputSender;
 use crate::router::{AgentResult, MessageRouter};
-use crate::types::{AgentNotification, AgentStatus, SwarmConfig, TaskItem, TaskStatus};
+use crate::types::{AgentNotification, AgentStatus, FileAccessNotification, SwarmConfig, TaskItem, TaskStatus};
 use flint_agent::{ToolContext, ToolRegistry};
 use flint_provider::Provider;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+/// Tracks which files are being accessed by which agents.
+pub struct FileAccessTracker {
+    /// agent_id -> set of files being accessed
+    agent_files: HashMap<String, HashSet<String>>,
+    /// file path -> list of agent_ids accessing it
+    file_agents: HashMap<String, Vec<String>>,
+}
+
+impl FileAccessTracker {
+    pub fn new() -> Self {
+        Self {
+            agent_files: HashMap::new(),
+            file_agents: HashMap::new(),
+        }
+    }
+
+    /// Record a file access by an agent.
+    pub fn record_access(&mut self, agent_id: &str, path: &str) {
+        self.agent_files
+            .entry(agent_id.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(path.to_string());
+
+        self.file_agents
+            .entry(path.to_string())
+            .or_insert_with(Vec::new)
+            .push(agent_id.to_string());
+    }
+
+    /// Remove all file accesses for an agent (when it completes).
+    pub fn remove_agent(&mut self, agent_id: &str) {
+        if let Some(files) = self.agent_files.remove(agent_id) {
+            for file in files {
+                if let Some(agents) = self.file_agents.get_mut(&file) {
+                    agents.retain(|id| id != agent_id);
+                    if agents.is_empty() {
+                        self.file_agents.remove(&file);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get all files being accessed by an agent.
+    pub fn get_agent_files(&self, agent_id: &str) -> Vec<String> {
+        self.agent_files
+            .get(agent_id)
+            .map(|files| files.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get all agents accessing a file.
+    pub fn get_file_agents(&self, path: &str) -> Vec<String> {
+        self.file_agents
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Check if a file is being accessed by any agent.
+    pub fn is_file_in_use(&self, path: &str) -> bool {
+        self.file_agents.contains_key(path)
+    }
+
+    /// Get a summary of all file access activity.
+    pub fn get_summary(&self) -> HashMap<String, Vec<String>> {
+        self.agent_files
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .collect()
+    }
+}
 
 struct AgentHandle {
     status: AgentStatus,
@@ -55,6 +128,11 @@ pub struct SwarmManager {
     /// The REPL drains this between turns to inform the main agent.
     notify_tx: mpsc::Sender<AgentNotification>,
     notify_rx: Option<mpsc::Receiver<AgentNotification>>,
+    /// Tracks which files are being accessed by which agents.
+    file_access_tracker: FileAccessTracker,
+    /// Channel for file access notifications from sub-agents.
+    file_access_tx: mpsc::Sender<FileAccessNotification>,
+    file_access_rx: Option<mpsc::Receiver<FileAccessNotification>>,
 }
 
 impl SwarmManager {
@@ -68,6 +146,7 @@ impl SwarmManager {
         router: Option<Arc<MessageRouter>>,
     ) -> Self {
         let (notify_tx, notify_rx) = mpsc::channel(64);
+        let (file_access_tx, file_access_rx) = mpsc::channel(64);
         Self {
             tasks: HashMap::new(),
             agents: HashMap::new(),
@@ -80,6 +159,9 @@ impl SwarmManager {
             router,
             notify_tx,
             notify_rx: Some(notify_rx),
+            file_access_tracker: FileAccessTracker::new(),
+            file_access_tx,
+            file_access_rx: Some(file_access_rx),
         }
     }
 
@@ -89,10 +171,51 @@ impl SwarmManager {
         self.notify_rx.take()
     }
 
+    /// Take the file access receiver. Can only be called once.
+    /// The REPL uses this to receive file access events from sub-agents.
+    pub fn take_file_access_rx(&mut self) -> Option<mpsc::Receiver<FileAccessNotification>> {
+        self.file_access_rx.take()
+    }
+
+    /// Get the file access tracker.
+    pub fn file_access_tracker(&self) -> &FileAccessTracker {
+        &self.file_access_tracker
+    }
+
+    /// Get mutable access to the file access tracker.
+    pub fn file_access_tracker_mut(&mut self) -> &mut FileAccessTracker {
+        &mut self.file_access_tracker
+    }
+
+    /// Get all files being accessed by a specific agent.
+    pub fn get_agent_files(&self, agent_id: &str) -> Vec<String> {
+        self.file_access_tracker.get_agent_files(agent_id)
+    }
+
+    /// Get all agents accessing a specific file.
+    pub fn get_file_agents(&self, path: &str) -> Vec<String> {
+        self.file_access_tracker.get_file_agents(path)
+    }
+
+    /// Check if a file is being accessed by any agent.
+    pub fn is_file_in_use(&self, path: &str) -> bool {
+        self.file_access_tracker.is_file_in_use(path)
+    }
+
+    /// Get a summary of all file access activity.
+    pub fn get_file_access_summary(&self) -> HashMap<String, Vec<String>> {
+        self.file_access_tracker.get_summary()
+    }
+
     /// Spawn a sub-agent. Returns a oneshot receiver for the first result.
     /// The agent stays alive for follow-up messages.
     /// The result is also delivered via the notification channel.
-    pub fn spawn_agent(&mut self, prompt: String, provider_override: Option<Arc<dyn Provider>>) -> anyhow::Result<SpawnResult> {
+    pub fn spawn_agent(
+        &mut self,
+        prompt: String,
+        provider_override: Option<Arc<dyn Provider>>,
+        fallback_providers: Vec<Arc<dyn Provider>>,
+    ) -> anyhow::Result<SpawnResult> {
         if self.agents.len() >= self.config.max_agents {
             return Err(anyhow::anyhow!(
                 "max agents ({}) reached. Stop an agent first.",
@@ -156,6 +279,7 @@ impl SwarmManager {
                 Some(input_response_rx),
                 None, // no display client
                 None, // no stream
+                fallback_providers,
             ).await;
         });
 
@@ -179,7 +303,12 @@ impl SwarmManager {
     /// The agent runs as a tokio task. Its output is streamed to the main
     /// terminal via a channel. The REPL displays the output and forwards
     /// user input to the agent when needed.
-    pub fn spawn_interactive(&mut self, prompt: String, provider_override: Option<Arc<dyn Provider>>) -> anyhow::Result<String> {
+    pub fn spawn_interactive(
+        &mut self,
+        prompt: String,
+        provider_override: Option<Arc<dyn Provider>>,
+        fallback_providers: Vec<Arc<dyn Provider>>,
+    ) -> anyhow::Result<String> {
         if self.agents.len() >= self.config.max_agents {
             return Err(anyhow::anyhow!("max agents ({}) reached", self.config.max_agents));
         }
@@ -233,6 +362,7 @@ impl SwarmManager {
                 Some(input_response_rx),
                 None, // no display client (output goes to stream)
                 Some(stream_tx),
+                fallback_providers,
             ).await;
         });
 
@@ -513,6 +643,17 @@ impl SwarmManager {
 
     pub fn config(&self) -> &SwarmConfig {
         &self.config
+    }
+
+    /// Update the default provider for sub-agents.
+    /// This allows changing the model at runtime without restarting.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
+    /// Get the current default provider.
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
     }
 
     /// Drain all pending input requests from sub-agents.

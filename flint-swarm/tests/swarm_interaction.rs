@@ -127,7 +127,7 @@ async fn test_spawn_and_wait() {
     );
 
     // Spawn
-    let spawn_result = manager.spawn_agent("test task".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("test task".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id.clone();
 
     // The agent should be alive
@@ -169,7 +169,7 @@ async fn test_followup_multi_turn() {
     );
 
     // Spawn
-    let spawn_result = manager.spawn_agent("initial task".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("initial task".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id;
 
     // Wait for initial result
@@ -218,7 +218,7 @@ async fn test_notification_channel() {
     let mut notify_rx = manager.take_notify_rx().unwrap();
 
     // Spawn
-    let spawn_result = manager.spawn_agent("notify task".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("notify task".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id;
     let task_id = spawn_result.task_id;
 
@@ -256,9 +256,9 @@ async fn test_multiple_agents_parallel() {
     );
 
     // Spawn 3 agents
-    let r1 = manager.spawn_agent("task 1".to_string()).unwrap();
-    let r2 = manager.spawn_agent("task 2".to_string()).unwrap();
-    let r3 = manager.spawn_agent("task 3".to_string()).unwrap();
+    let r1 = manager.spawn_agent("task 1".to_string(), None, Vec::new()).unwrap();
+    let r2 = manager.spawn_agent("task 2".to_string(), None, Vec::new()).unwrap();
+    let r3 = manager.spawn_agent("task 3".to_string(), None, Vec::new()).unwrap();
 
     // Wait for all results in parallel
     let rx1 = manager.take_initial_result(&r1.agent_id).unwrap();
@@ -294,7 +294,7 @@ async fn test_wait_after_completion() {
             ToolRegistry::new(), None,
     );
 
-    let spawn_result = manager.spawn_agent("quick task".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("quick task".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id;
 
     // Wait for completion
@@ -328,7 +328,7 @@ async fn test_stop_agent() {
             ToolRegistry::new(), None,
     );
 
-    let spawn_result = manager.spawn_agent("stop task".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("stop task".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id;
 
     // Stop the agent
@@ -356,10 +356,10 @@ async fn test_agent_count() {
 
     assert_eq!(manager.active_agent_count(), 0);
 
-    let r1 = manager.spawn_agent("t1".to_string()).unwrap();
+    let r1 = manager.spawn_agent("t1".to_string(), None, Vec::new()).unwrap();
     assert_eq!(manager.active_agent_count(), 1);
 
-    let r2 = manager.spawn_agent("t2".to_string()).unwrap();
+    let r2 = manager.spawn_agent("t2".to_string(), None, Vec::new()).unwrap();
     assert_eq!(manager.active_agent_count(), 2);
 
     manager.stop_agent(&r1.agent_id).unwrap();
@@ -396,7 +396,7 @@ async fn test_input_request_response_e2e() {
     );
 
     // Spawn the sub-agent
-    let spawn_result = manager.spawn_agent("introduce yourself".to_string()).unwrap();
+    let spawn_result = manager.spawn_agent("introduce yourself".to_string(), None, Vec::new()).unwrap();
     let agent_id = spawn_result.agent_id.clone();
 
     // Wait for the agent to send an input request
@@ -465,7 +465,7 @@ async fn test_two_agents_input_requests() {
         ToolRegistry::new(),
         None,
     );
-    let spawn_a = manager_a.spawn_agent("task A".to_string()).unwrap();
+    let spawn_a = manager_a.spawn_agent("task A".to_string(), None, Vec::new()).unwrap();
 
     // Spawn agent B
     let mut manager_b = SwarmManager::new(
@@ -477,7 +477,7 @@ async fn test_two_agents_input_requests() {
         ToolRegistry::new(),
         None,
     );
-    let spawn_b = manager_b.spawn_agent("task B".to_string()).unwrap();
+    let spawn_b = manager_b.spawn_agent("task B".to_string(), None, Vec::new()).unwrap();
 
     // Wait for both to send input requests
     let mut req_a = None;

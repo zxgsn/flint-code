@@ -43,14 +43,17 @@ if (-not (Test-Path $Dir)) {
 Copy-Item $Binary "$Dir\flint.exe" -Force
 Write-Host "  OK: $Dir\flint.exe" -ForegroundColor Green
 
-# Check PATH
+# Ensure install directory is in PATH
 $CurrentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($CurrentPath -notlike "*$Dir*") {
-    Write-Host ""
-    Write-Host "  NOTE: $Dir is not in your PATH." -ForegroundColor DarkYellow
-    Write-Host "  Add it with:" -ForegroundColor DarkYellow
-    Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"$CurrentPath;$Dir`", 'User')" -ForegroundColor White
-    Write-Host ""
+    [Environment]::SetEnvironmentVariable("Path", "$CurrentPath;$Dir", "User")
+    $env:Path = "$env:Path;$Dir"
+    Write-Host "  Added $Dir to user PATH" -ForegroundColor Green
+} else {
+    # Even if already in persistent PATH, ensure current session can use it
+    if ($env:Path -notlike "*$Dir*") {
+        $env:Path = "$env:Path;$Dir"
+    }
 }
 
 # ── 3. Done ───────────────────────────────────────────────────────────────
@@ -59,6 +62,8 @@ Write-Host ""
 Write-Host "  Binary : $Dir\flint.exe" -ForegroundColor Gray
 Write-Host "  Usage  : flint config" -ForegroundColor Gray
 Write-Host "           flint 'your prompt here'" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  NOTE: Open a new terminal for PATH changes to take effect." -ForegroundColor DarkYellow
 Write-Host ""
 
 if ($Run) {

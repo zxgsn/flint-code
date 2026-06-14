@@ -15,8 +15,8 @@ fn italic() -> &'static str { "\x1b[3m" }
 fn underline() -> &'static str { "\x1b[4m" }
 fn fg_cyan() -> &'static str { "\x1b[36m" }
 fn fg_yellow() -> &'static str { "\x1b[33m" }
-fn fg_green() -> &'static str { "\x1b[32m" }
-fn fg_red() -> &'static str { "\x1b[31m" }
+fn _fg_green() -> &'static str { "\x1b[32m" }
+fn _fg_red() -> &'static str { "\x1b[31m" }
 fn fg_magenta() -> &'static str { "\x1b[35m" }
 fn fg_blue() -> &'static str { "\x1b[34m" }
 fn bg_dark() -> &'static str { "\x1b[48;5;236m" }
@@ -30,7 +30,6 @@ pub fn render_markdown<W: Write>(out: &mut W, text: &str) {
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
     let mut in_code_block = false;
-    let mut code_lang = String::new();
 
     while i < lines.len() {
         let line = lines[i];
@@ -46,7 +45,7 @@ pub fn render_markdown<W: Write>(out: &mut W, text: &str) {
             }
             // Start of code block
             in_code_block = true;
-            code_lang = line.trim_start().trim_start_matches('`').trim().to_string();
+            let code_lang = line.trim_start().trim_start_matches('`').trim().to_string();
             let lang_label = if code_lang.is_empty() { String::new() } else { format!(" {}{}{}", fg_cyan(), code_lang, fg_gray()) };
             writeln!(out, "{}{}┌───{}{}", fg_gray(), dim(), lang_label, reset()).ok();
             i += 1;
@@ -136,7 +135,7 @@ pub fn render_markdown<W: Write>(out: &mut W, text: &str) {
 }
 
 /// Render a single line to a string (for use in other contexts).
-pub fn render_markdown_line(text: &str) -> String {
+pub fn _render_markdown_line(text: &str) -> String {
     render_inline(text)
 }
 

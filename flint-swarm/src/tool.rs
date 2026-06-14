@@ -17,6 +17,16 @@
 //!     ├─ request_input → asks user questions
 //!     └─ Reports result via notification channel
 //! ```
+//!
+//! ## Model Fallback
+//!
+//! When a sub-agent's model fails (provider build error or LLM call failure),
+//! the system automatically tries other available models before giving up:
+//!
+//! 1. Try the requested model
+//! 2. Try other models in `agent_models` (slots)
+//! 3. Try the `default_model`
+//! 4. Fall back to the parent's provider
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -47,6 +57,94 @@ pub struct SwarmTool {
     pub model_selection: String,
     /// Auto-incrementing slot counter for "slots" mode.
     pub next_slot: AtomicUsize,
+}
+
+impl SwarmTool {
+    /// Try to build a provider for the requested model, with automatic fallback
+    /// to other available models if the requested one fails.
+    ///
+    /// Returns (provider, model_name_used, fallback_happened).
+    fn build_provider_with_fallback(
+        &self,
+        requested_model: &str,
+    ) -> (Option<Arc<dyn flint_provider::Provider>>, String, bool) {
+        // 1. Try the requested model
+        if let Some(provider) = (self.build_provider)(requested_model) {
+            return (Some(provider), requested_model.to_string(), false);
+        }
+
+        eprintln!(
+            "\x1b[33m  [swarm] model '{}' unavailable, trying fallback...\x1b[0m",
+            requested_model
+        );
+
+        // 2. Try other models in agent_models (skip the one we already tried)
+        for model in &self.agent_models {
+            if model.is_empty() || model == requested_model {
+                continue;
+            }
+            if let Some(provider) = (self.build_provider)(model) {
+                eprintln!(
+                    "\x1b[33m  [swarm] fallback: using model '{}'\x1b[0m",
+                    model
+                );
+                return (Some(provider), model.clone(), true);
+            }
+        }
+
+        // 3. Try the default_model (if different from requested)
+        if let Some(ref default) = self.default_model {
+            if default != requested_model && !self.agent_models.contains(default) {
+                if let Some(provider) = (self.build_provider)(default) {
+                    eprintln!(
+                        "\x1b[33m  [swarm] fallback: using default model '{}'\x1b[0m",
+                        default
+                    );
+                    return (Some(provider), default.clone(), true);
+                }
+            }
+        }
+
+        // 4. All models failed — return None (will inherit parent provider)
+        eprintln!(
+            "\x1b[31m  [swarm] all models failed, will inherit parent provider\x1b[0m"
+        );
+        (None, requested_model.to_string(), true)
+    }
+
+    /// Collect all available models as fallback candidates.
+    fn fallback_candidates(&self, exclude: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for model in &self.agent_models {
+            if !model.is_empty() && model != exclude {
+                candidates.push(model.clone());
+            }
+        }
+        if let Some(ref default) = self.default_model {
+            if default != exclude && !candidates.contains(default) {
+                candidates.push(default.clone());
+            }
+        }
+        candidates
+    }
+
+    /// Update the default model for sub-agents at runtime.
+    /// Returns the old model for reference.
+    pub fn set_default_model(&mut self, model: Option<String>) -> Option<String> {
+        let old = self.default_model.take();
+        self.default_model = model;
+        old
+    }
+
+    /// Update the agent models list at runtime.
+    pub fn set_agent_models(&mut self, models: Vec<String>) {
+        self.agent_models = models;
+    }
+
+    /// Update the model selection strategy at runtime.
+    pub fn set_model_selection(&mut self, strategy: String) {
+        self.model_selection = strategy;
+    }
 }
 
 #[async_trait]
@@ -146,17 +244,33 @@ impl Tool for SwarmTool {
                     }
                 };
 
-                // Build provider override if a specific model was resolved
-                let provider_override = resolved_model.as_ref().and_then(|m| {
-                    (self.build_provider)(m)
-                });
-                let model_label = resolved_model.clone().unwrap_or_else(|| "default".to_string());
+                // Build provider with fallback chain
+                let (provider_override, model_label, fallback_happened) = match resolved_model {
+                    Some(ref model) => {
+                        let (prov, used, fb) = self.build_provider_with_fallback(model);
+                        (prov, used, fb)
+                    }
+                    None => (None, "default".to_string(), false),
+                };
+                if fallback_happened {
+                    eprintln!(
+                        "\x1b[33m  [swarm] model fallback: requested '{}', using '{}'\x1b[0m",
+                        resolved_model.as_deref().unwrap_or("default"),
+                        model_label
+                    );
+                }
+
+                // Collect fallback providers for model resilience
+                let fallback_models = self.fallback_candidates(&model_label);
+                let fallback_providers: Vec<Arc<dyn flint_provider::Provider>> = fallback_models.iter()
+                    .filter_map(|m| (self.build_provider)(m))
+                    .collect();
 
                 if mode == "in-process" {
                     // In-process mode: runs as background tokio task
                     let spawn_result = {
                         let mut swarm = self.swarm.lock().unwrap();
-                        swarm.spawn_agent(prompt.to_string(), provider_override)
+                        swarm.spawn_agent(prompt.to_string(), provider_override, fallback_providers)
                     };
                     match spawn_result {
                         Ok(result) => {
@@ -200,7 +314,7 @@ impl Tool for SwarmTool {
                     // Interactive mode: streaming display in main terminal
                     let spawn_result = {
                         let mut swarm = self.swarm.lock().unwrap();
-                        swarm.spawn_interactive(prompt.to_string(), provider_override)
+                        swarm.spawn_interactive(prompt.to_string(), provider_override, fallback_providers)
                     };
                     match spawn_result {
                         Ok(agent_id) => {
@@ -276,16 +390,30 @@ impl Tool for SwarmTool {
                     .ok_or_else(|| anyhow::anyhow!("missing 'agent_id'"))?;
 
                 // Check cached result (non-blocking)
-                let (_task_id, cached) = {
+                let (_task_id, cached, is_failed) = {
                     let swarm = self.swarm.lock().unwrap();
                     let tid = swarm.agent_status().iter()
                         .find(|(id, _, _)| id == agent_id)
                         .and_then(|(_, _, tid)| tid.clone());
-                    let cached = tid.as_ref().and_then(|t| swarm.get_task_result(t));
-                    (tid, cached)
+                    let (cached, is_failed) = tid.as_ref().map(|t| {
+                        let tasks = swarm.task_status();
+                        let task = tasks.iter().find(|task| task.id == *t);
+                        let is_failed = task.map(|t| t.status == crate::types::TaskStatus::Failed).unwrap_or(false);
+                        let result = swarm.get_task_result(t);
+                        (result, is_failed)
+                    }).unwrap_or((None, false));
+                    (tid, cached, is_failed)
                 };
 
                 if let Some(result) = cached {
+                    if is_failed {
+                        return Ok(ToolOutput::error(format!(
+                            "Agent {} failed: {}\n\n\
+                             The agent encountered an error and cannot continue. \
+                             You should handle this task yourself or try spawning a new agent.",
+                            agent_id, result
+                        )));
+                    }
                     return Ok(ToolOutput::text(format!("[{}]\n{}", agent_id, result)));
                 }
 
@@ -357,7 +485,10 @@ impl Tool for SubReadTool {
     }
 }
 
-pub struct SubWriteTool;
+pub struct SubWriteTool {
+    pub agent_id: String,
+    pub file_access_tx: tokio::sync::mpsc::Sender<crate::types::FileAccessNotification>,
+}
 #[async_trait]
 impl Tool for SubWriteTool {
     fn definition(&self) -> ToolDefinition {
@@ -370,11 +501,22 @@ impl Tool for SubWriteTool {
         let full = ctx.working_dir.join(path);
         if let Some(p) = full.parent() { std::fs::create_dir_all(p)?; }
         std::fs::write(&full, content)?;
+
+        // Report file access
+        let _ = self.file_access_tx.try_send(crate::types::FileAccessNotification {
+            agent_id: self.agent_id.clone(),
+            path: path.to_string(),
+            operation: "write".to_string(),
+        });
+
         Ok(ToolOutput::text(format!("wrote {}", full.display())))
     }
 }
 
-pub struct SubEditTool;
+pub struct SubEditTool {
+    pub agent_id: String,
+    pub file_access_tx: tokio::sync::mpsc::Sender<crate::types::FileAccessNotification>,
+}
 #[async_trait]
 impl Tool for SubEditTool {
     fn definition(&self) -> ToolDefinition {
@@ -414,6 +556,14 @@ impl Tool for SubEditTool {
         if let Err(e) = std::fs::write(&full, &new_content) {
             return Ok(ToolOutput::error(format!("cannot write {}: {}", full.display(), e)));
         }
+
+        // Report file access
+        let _ = self.file_access_tx.try_send(crate::types::FileAccessNotification {
+            agent_id: self.agent_id.clone(),
+            path: path.to_string(),
+            operation: "edit".to_string(),
+        });
+
         Ok(ToolOutput::text(format!("edited {}", full.display())))
     }
 }
@@ -641,10 +791,20 @@ pub fn register_swarm_tools(
 /// Register base file/shell tools on a sub-agent's registry.
 /// These give the sub-agent full autonomy to read, write, edit files,
 /// run shell commands, search code, and fetch URLs.
-pub fn register_sub_agent_tools(registry: &mut ToolRegistry) {
+pub fn register_sub_agent_tools(
+    registry: &mut ToolRegistry,
+    agent_id: &str,
+    file_access_tx: tokio::sync::mpsc::Sender<crate::types::FileAccessNotification>,
+) {
     registry.register(SubReadTool);
-    registry.register(SubWriteTool);
-    registry.register(SubEditTool);
+    registry.register(SubWriteTool {
+        agent_id: agent_id.to_string(),
+        file_access_tx: file_access_tx.clone(),
+    });
+    registry.register(SubEditTool {
+        agent_id: agent_id.to_string(),
+        file_access_tx: file_access_tx.clone(),
+    });
     registry.register(SubBashTool);
     registry.register(SubGrepTool);
     registry.register(SubGlobTool);

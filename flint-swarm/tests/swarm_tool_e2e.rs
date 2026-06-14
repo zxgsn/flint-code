@@ -534,7 +534,7 @@ async fn test_sub_agent_executes_tool_autonomously() {
     let mut notify_rx = manager.take_notify_rx().unwrap();
 
     // Spawn the agent
-    let spawn = manager.spawn_agent("write a file called output.txt".into()).unwrap();
+    let spawn = manager.spawn_agent("write a file called output.txt".into(), None, Vec::new()).unwrap();
     let agent_id = spawn.agent_id.clone();
     let task_id = spawn.task_id.clone();
 
@@ -632,7 +632,7 @@ async fn test_agent_independent_multi_task() {
     );
 
     // ── Step 1: Spawn with initial task ────────────────────────────────
-    let spawn = manager.spawn_agent("create task1.txt with content 'first task output'".into()).unwrap();
+    let spawn = manager.spawn_agent("create task1.txt with content 'first task output'".into(), None, Vec::new()).unwrap();
     let agent_id = spawn.agent_id.clone();
 
     // Wait for initial result
@@ -704,8 +704,8 @@ async fn test_two_agents_no_interference() {
     let mut mgr_b = SwarmManager::new(cfg, provider_b, tmp_b.clone(), sys, output_tx, ToolRegistry::new(), None);
 
     // Spawn both
-    let sa = mgr_a.spawn_agent("write output.txt".into()).unwrap();
-    let sb = mgr_b.spawn_agent("write output.txt".into()).unwrap();
+    let sa = mgr_a.spawn_agent("write output.txt".into(), None, Vec::new()).unwrap();
+    let sb = mgr_b.spawn_agent("write output.txt".into(), None, Vec::new()).unwrap();
 
     // Wait for both
     let rx_a = mgr_a.take_initial_result(&sa.agent_id).unwrap();

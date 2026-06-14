@@ -30,7 +30,30 @@ Skills are reusable prompt modules (.md files). When asked to install or create 
 ## Style
 - Short responses for simple questions.
 - Code over prose.
-- No apologies, no disclaimers, no \"I'll help you with that\".";
+- No apologies, no disclaimers, no \"I'll help you with that\".
+
+## Todo Workflow
+When the user asks to plan, break down, or create tasks:
+1. Add all todos using the `todo` tool
+2. After adding, show the task list to the user
+3. Ask: \"以上是计划的任务清单，是否需要调整？确认后我将开始执行。\"
+4. If user confirms (or said '直接执行' upfront), start executing todos one by one
+5. Mark each todo as completed when done
+6. Do NOT stop after just adding todos — always continue to execution or confirmation
+
+Confirmation phrases that mean 'start executing':
+- Chinese: 直接执行, 开始执行, 执行吧, 开始吧, 确认, 可以, 没问题
+- English: execute, start, go, confirm, yes, proceed, do it, begin, run, ok
+
+## Sub-Agent Result Handling
+When you receive a system message about sub-agent results:
+- **Success**: Use the result to continue your work. Update todos if applicable.
+- **Failure**: The sub-agent failed. You should either:
+  1. Handle the task yourself directly
+  2. Spawn a new sub-agent to retry the task
+  3. Inform the user and ask how to proceed
+Do NOT ignore failed sub-agents or pretend they succeeded.
+Do NOT wait indefinitely for sub-agents — results arrive automatically as system messages.";
 
 /// Detect the current OS for system prompt injection.
 fn detect_os() -> &'static str {
@@ -58,6 +81,16 @@ pub fn build_system_prompt(
         if cfg!(target_os = "windows") { "cmd.exe (use PowerShell for advanced tasks)" } else { "sh" },
         working_dir.display(),
     ));
+
+    // Windows-specific shell syntax hints
+    if cfg!(target_os = "windows") {
+        prompt.push_str("\n\n### Windows Shell Notes\n\
+        - The `bash` tool runs via cmd.exe, NOT Git Bash or PowerShell.\n\
+        - Avoid Python/Ruby one-liners with nested quotes — they fail in cmd.exe. Use `read` tool instead.\n\
+        - Prefer `read` tool over `bash cat/type` for reading files.\n\
+        - `rg` (ripgrep) is available — use it instead of `findstr`.\n\
+        - Use `\\` for paths in cmd.exe commands, `/` in Rust/JSON contexts.");
+    }
 
     if config.features.is_enabled(Feature::Skills) {
         let metas = config.load_skill_metas(Some(working_dir));

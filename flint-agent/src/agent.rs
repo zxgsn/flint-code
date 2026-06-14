@@ -173,6 +173,13 @@ pub async fn run_turn(
         let mut line_buffer = String::new();
 
         while let Some(event) = stream.next().await {
+            // Check cancellation during streaming — allows interrupting long LLM responses
+            if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+                if !silent {
+                    eprintln!("\n{}", yellow("  ── interrupted by user ──"));
+                }
+                break;
+            }
             match event? {
                 StreamEvent::TextDelta(t) => {
                     if first_delta {
@@ -238,6 +245,16 @@ pub async fn run_turn(
                 print!("{}", line_buffer);
             }
             line_buffer.clear();
+        }
+
+        // If cancelled during streaming, return what we have so far
+        if cancel.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            if !text.is_empty() {
+                session.add_assistant(&text);
+            }
+            stats.llm_calls = turn_iter;
+            stats.total_chars = token_count;
+            return Ok((text, stats));
         }
 
         // No tool calls → turn is done

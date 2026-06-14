@@ -351,6 +351,13 @@ pub async fn run(
     let swarm_notify_shared: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::AgentNotification>>>> =
         swarm_notify.map(|rx| Arc::new(Mutex::new(rx)));
 
+    // Get file access notification channel from swarm manager
+    let file_access_rx: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::FileAccessNotification>>>> =
+        swarm.as_ref().and_then(|sw| {
+            let mut sm = sw.lock().unwrap();
+            sm.take_file_access_rx().map(|rx| Arc::new(Mutex::new(rx)))
+        });
+
     // Get router Arc for real-time result checking (coordinator side)
     let router_arc_for_results: Option<Arc<flint_swarm::MessageRouter>> = swarm.as_ref()
         .and_then(|sw| sw.lock().unwrap().router_arc());
@@ -738,9 +745,11 @@ pub async fn run(
         // during run_turn, so the user sees progress without waiting for the turn to end.
         let cb_notify = swarm_notify_shared.clone();
         let cb_swarm = swarm.clone();
+        let cb_file_access = file_access_rx.clone();
         let turn_callback: flint_agent::EventCallback = Box::new(move |_event| {
             drain_and_display_notifications_sync(&cb_notify, &cb_swarm);
             drain_and_display_streams_sync(&cb_swarm);
+            drain_file_access_notifications(&cb_file_access, &cb_swarm);
             true
         });
 
@@ -984,6 +993,12 @@ pub async fn run(
         // Drain sub-agent completion notifications and display to user
         drain_and_display_notifications(
             &swarm_notify_shared,
+            &swarm,
+        );
+
+        // Drain file access notifications from sub-agents
+        drain_file_access_notifications(
+            &file_access_rx,
             &swarm,
         );
 
@@ -1615,6 +1630,25 @@ fn drain_and_display_notifications_sync(
     swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
 ) {
     drain_and_display_notifications(notify_shared, swarm);
+}
+
+/// Drain file access notifications from sub-agents and update the tracker.
+fn drain_file_access_notifications(
+    file_access_rx: &Option<Arc<Mutex<tokio::sync::mpsc::Receiver<flint_swarm::FileAccessNotification>>>>,
+    swarm: &Option<Arc<Mutex<flint_swarm::SwarmManager>>>,
+) {
+    if let Some(ref rx) = file_access_rx {
+        let mut rx = rx.lock().unwrap();
+        while let Ok(notification) = rx.try_recv() {
+            if let Some(ref sw) = swarm {
+                let mut sm = sw.lock().unwrap();
+                sm.file_access_tracker_mut().record_access(
+                    &notification.agent_id,
+                    &notification.path,
+                );
+            }
+        }
+    }
 }
 
 /// Drain streaming output from interactive agents during run_turn callback.

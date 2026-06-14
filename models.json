@@ -1,0 +1,120 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "sapiens-ai/agnes-1.5-pro",
+      "object": "model",
+      "created": 1775260800,
+      "owned_by": "sapiens-ai",
+      "name": "Agnes 1.5 Pro",
+      "description": "High-performance text model for advanced reasoning, multi-turn conversation, and tool calling.",
+      "architecture": {
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "modality": "text->text",
+        "tokenizer": "tiktoken"
+      },
+      "context_length": 256000,
+      "pricing": {
+        "prompt": 0.00000016,
+        "completion": 0.0000008
+      },
+      "capabilities": {
+        "chat": true,
+        "tool_calling": true,
+        "reasoning": true,
+        "multimodal": false
+      },
+      "routing": {
+        "type": "chat",
+        "endpoint": "/v1/chat/completions"
+      }
+    },
+    {
+      "id": "sapiens-ai/agnes-1.5-lite",
+      "object": "model",
+      "created": 1775260800,
+      "owned_by": "sapiens-ai",
+      "name": "Agnes 1.5 Lite",
+      "description": "Lightweight multimodal model optimized for low latency, high concurrency, and cost efficiency.",
+      "architecture": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "modality": "text+image->text",
+        "tokenizer": "tiktoken"
+      },
+      "context_length": 256000,
+      "pricing": {
+        "prompt": 0.00000012,
+        "completion": 0.0000006
+      },
+      "capabilities": {
+        "chat": true,
+        "multimodal": true,
+        "low_latency": true
+      },
+      "routing": {
+        "type": "chat",
+        "endpoint": "/v1/chat/completions"
+      }
+    },
+    {
+      "id": "sapiens-ai/agnes-image-1.2",
+      "object": "model",
+      "created": 1775260800,
+      "owned_by": "sapiens-ai",
+      "name": "Agnes Image 1.2",
+      "description": "Image generation model supporting text-to-image and image-to-image workflows.",
+      "architecture": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["image"],
+        "modality": "text+image->image"
+      },
+      "pricing": {
+        "image": 0.008
+      },
+      "capabilities": {
+        "image_generation": true,
+        "image_to_image": true,
+        "text_to_image": true
+      },
+      "routing": {
+        "type": "image",
+        "endpoint": "/v1/images/generations"
+      }
+    },
+    {
+      "id": "sapiens-ai/agnes-video-v1.2",
+      "object": "model",
+      "created": 1775260800,
+      "owned_by": "sapiens-ai",
+      "name": "Agnes Video V1.2",
+      "description": "Cinematic-grade async video generation model with synchronized audio.",
+      "architecture": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["video", "audio"],
+        "modality": "text+image->video+audio"
+      },
+      "pricing": {
+        "video": 0.018
+      },
+      "capabilities": {
+        "video_generation": true,
+        "async": true,
+        "text_to_video": true,
+        "image_to_video": true
+      },
+      "constraints": {
+        "max_frames": 441,
+        "frame_rule": "8n+1",
+        "fps_range": [1, 60]
+      },
+      "routing": {
+        "type": "video",
+        "mode": "async",
+        "create_endpoint": "/v1/videos",
+        "retrieve_endpoint": "/v1/videos/{task_id}"
+      }
+    }
+  ]
+}

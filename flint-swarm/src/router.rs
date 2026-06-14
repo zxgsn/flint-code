@@ -52,11 +52,11 @@ pub struct MessageRouter {
     /// Connected agents: agent_id → writer half.
     agents: Arc<Mutex<HashMap<String, ConnectedAgent>>>,
     /// Channel for result messages from agents.
-    result_tx: mpsc::Sender<AgentResult>,
+    _result_tx: mpsc::Sender<AgentResult>,
     result_rx: Arc<Mutex<mpsc::Receiver<AgentResult>>>,
     /// Channel for incoming messages to agents (coordinator → agent).
-    inbound_tx: mpsc::Sender<InboundMessage>,
-    inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
+    _inbound_tx: mpsc::Sender<InboundMessage>,
+    _inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
 }
 
 /// Result reported by an agent through the router.
@@ -90,10 +90,10 @@ impl MessageRouter {
         let router = Self {
             addr,
             agents: agents.clone(),
-            result_tx: result_tx.clone(),
+            _result_tx: result_tx.clone(),
             result_rx: Arc::new(Mutex::new(result_rx)),
-            inbound_tx: inbound_tx.clone(),
-            inbound_rx: Arc::new(Mutex::new(inbound_rx)),
+            _inbound_tx: inbound_tx.clone(),
+            _inbound_rx: Arc::new(Mutex::new(inbound_rx)),
         };
 
         // Spawn the accept loop

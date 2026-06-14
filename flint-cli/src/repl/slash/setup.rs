@@ -1,12 +1,13 @@
 //! `/setup` — configure provider interactively.
 
+use async_trait::async_trait;
 use super::{SlashCommand, SlashContext, CommandResult};
 use anyhow::Result;
-use flint_provider::Provider;
 use std::sync::Arc;
 
 pub struct SetupCommand;
 
+#[async_trait]
 impl SlashCommand for SetupCommand {
     fn name(&self) -> &str { "setup" }
 

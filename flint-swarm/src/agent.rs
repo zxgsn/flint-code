@@ -19,20 +19,38 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Build the base sub-agent registry (file/shell tools only).
 /// Used when no coordinator registry is available.
-pub fn build_sub_agent_registry() -> ToolRegistry {
+pub fn build_sub_agent_registry(
+    agent_id: &str,
+    file_access_tx: mpsc::Sender<crate::types::FileAccessNotification>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(crate::tool::SubReadTool);
-    registry.register(crate::tool::SubWriteTool);
-    registry.register(crate::tool::SubEditTool);
-    registry.register(crate::tool::SubBashTool);
-    registry.register(crate::tool::SubGrepTool);
-    registry.register(crate::tool::SubGlobTool);
-    registry.register(crate::tool::SubWebFetchTool);
+    crate::tool::register_sub_agent_tools(&mut registry, agent_id, file_access_tx);
     registry
 }
 
 fn fmt_elapsed(ms: u64) -> String {
     if ms < 1000 { format!("{}ms", ms) } else { format!("{:.1}s", ms as f64 / 1000.0) }
+}
+
+/// Check if an error is transient and worth retrying.
+fn is_retryable_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    let retryable_markers = [
+        "timeout", "timed out", "connection reset", "connection refused",
+        "broken pipe", "network", "dns", "temporary", "overloaded",
+        "rate limit", "429", "500", "502", "503", "504",
+        "eof", "unexpected eof", "connection closed",
+    ];
+    let non_retryable_markers = [
+        "401", "403", "402", "invalid api key", "authentication",
+        "billing", "credits", "quota", "model_not_found",
+        "context_length_exceeded", "invalid_request",
+    ];
+    // Non-retryable errors take precedence
+    if non_retryable_markers.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    retryable_markers.iter().any(|m| lower.contains(m))
 }
 
 /// Request sent to a sub-agent.
@@ -83,7 +101,11 @@ pub async fn run_sub_agent(
     mut input_response_rx: Option<mpsc::Receiver<InputResponse>>,
     display_agent_id: Option<String>,
     stream_tx: Option<mpsc::Sender<String>>,
+    fallback_providers: Vec<Arc<dyn Provider>>,
 ) {
+    // Retry configuration for transient LLM failures
+    const MAX_RETRIES: u32 = 3;
+    const INITIAL_BACKOFF_MS: u64 = 1000;
     let _ = output_tx.send(OutputEvent::Started {
         agent_id: agent_id.clone(),
         task_id: task_id.clone(),
@@ -108,7 +130,9 @@ pub async fn run_sub_agent(
 
     // Always register base sub-agent tools (file/shell) so the agent
     // can work independently regardless of what the coordinator has.
-    crate::tool::register_sub_agent_tools(&mut registry);
+    // Create a file access channel for this agent
+    let (file_access_tx, _file_access_rx) = mpsc::channel(64);
+    crate::tool::register_sub_agent_tools(&mut registry, &agent_id, file_access_tx);
 
     // Register agent-to-agent communication tools if router is available
     if let Some(ref router_arc) = router {
@@ -234,17 +258,78 @@ pub async fn run_sub_agent(
                     }
 
                     let api_start = Instant::now();
-                    let stream_result = provider.complete(
-                        &session.messages, &registry.definitions(), &system,
-                    ).await;
+                    let mut current_provider = provider.clone();
+                    let mut stream_result = None;
+                    let mut retry_count = 0u32;
+                    let mut backoff_ms = INITIAL_BACKOFF_MS;
+                    let mut used_fallback = false;
+
+                    // Retry loop with exponential backoff and model fallback
+                    loop {
+                        let result = current_provider.complete(
+                            &session.messages, &registry.definitions(), &system,
+                        ).await;
+
+                        match result {
+                            Ok(s) => {
+                                stream_result = Some(s);
+                                break;
+                            }
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                let is_retryable = is_retryable_error(&err_str);
+
+                                if retry_count < MAX_RETRIES && is_retryable {
+                                    retry_count += 1;
+                                    {
+                                        let mut f = log.lock().unwrap();
+                                        let _ = writeln!(f, "\n~ retry {}/{} after {}ms: {}",
+                                            retry_count, MAX_RETRIES, backoff_ms, err_str);
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                                    backoff_ms *= 2; // exponential backoff
+                                    continue;
+                                }
+
+                                // Retries exhausted or non-retryable — try fallback providers
+                                if !used_fallback && !fallback_providers.is_empty() {
+                                    for (i, fb) in fallback_providers.iter().enumerate() {
+                                        {
+                                            let mut f = log.lock().unwrap();
+                                            let _ = writeln!(f, "\n~ trying fallback provider {}...", i + 1);
+                                        }
+                                        let fb_result = fb.complete(
+                                            &session.messages, &registry.definitions(), &system,
+                                        ).await;
+                                        match fb_result {
+                                            Ok(s) => {
+                                                current_provider = fb.clone();
+                                                used_fallback = true;
+                                                stream_result = Some(s);
+                                                break;
+                                            }
+                                            Err(fb_err) => {
+                                                let mut f = log.lock().unwrap();
+                                                let _ = writeln!(f, "\n~ fallback {} failed: {}", i + 1, fb_err);
+                                            }
+                                        }
+                                    }
+                                    if stream_result.is_some() {
+                                        break;
+                                    }
+                                }
+
+                                // All retries and fallbacks exhausted
+                                result_err = Some(err_str.clone());
+                                write_error_log(&log, &e);
+                                break;
+                            }
+                        }
+                    }
 
                     let mut stream = match stream_result {
-                        Ok(s) => s,
-                        Err(e) => {
-                            result_err = Some(e.to_string());
-                            write_error_log(&log, &e);
-                            break;
-                        }
+                        Some(s) => s,
+                        None => break,
                     };
 
                     let mut text = String::new();
@@ -641,7 +726,7 @@ pub fn spawn_interactive_agent(
     // checks this file before each turn and injects messages as context.
     let comm_path = log::log_dir().join(format!("{}_{}.comm.txt", agent_id, task_id));
     let _ = std::fs::write(&comm_path, "");
-    let comm_path_str = comm_path.to_string_lossy().to_string();
+    let _comm_path_str = comm_path.to_string_lossy().to_string();
 
     // Build router flag if available
     let router_flag = router_addr
@@ -806,7 +891,7 @@ pub fn spawn_terminal_agent(
     Ok(ctx_path)
 }
 
-fn write_to_log(log: &Arc<std::sync::Mutex<std::fs::File>>, _agent_id: &str, event: &AgentEvent) {
+fn _write_to_log(log: &Arc<std::sync::Mutex<std::fs::File>>, _agent_id: &str, event: &AgentEvent) {
     let mut f = log.lock().unwrap();
     match event {
         AgentEvent::Thinking => { let _ = writeln!(f, "\n~ thinking..."); }

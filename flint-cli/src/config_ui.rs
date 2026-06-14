@@ -323,11 +323,156 @@ impl SwarmDetail {
     }
 }
 
+// ── Provider detail page ────────────────────────────────────────────────────
+
+struct ProviderDetail {
+    provider_type: String,
+    model: String,
+    api_key: String,
+    base_url: String,
+    env_path: std::path::PathBuf,
+    focus: usize, // 0: type, 1: model, 2: api_key, 3: base_url
+    show_key: bool,
+    // Model suggestions
+    recent_models: Vec<String>,
+    suggestions: Vec<usize>,
+    suggestion_idx: usize,
+    editing: bool, // true when editing a text field
+}
+
+impl ProviderDetail {
+    fn from_config(config: &Config, env_path: std::path::PathBuf) -> Self {
+        let provider_type = config.provider.r#type.clone();
+        let model = config.provider.model.clone();
+
+        // Read current API key and base URL from env
+        let api_key_env = match provider_type.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            _ => "OPENAI_API_KEY",
+        };
+        let base_url_env = match provider_type.as_str() {
+            "anthropic" => "ANTHROPIC_BASE_URL",
+            _ => "OPENAI_BASE_URL",
+        };
+        let api_key = std::env::var(api_key_env).unwrap_or_default();
+        let base_url = std::env::var(base_url_env).unwrap_or_default();
+
+        let mut recent: Vec<String> = config.provider.recent_models.clone();
+        if !recent.contains(&model) {
+            recent.push(model.clone());
+        }
+
+        Self {
+            provider_type,
+            model,
+            api_key,
+            base_url,
+            env_path,
+            focus: 0,
+            show_key: false,
+            recent_models: recent,
+            suggestions: Vec::new(),
+            suggestion_idx: 0,
+            editing: false,
+        }
+    }
+
+    fn apply(&self, config: &mut Config) {
+        config.provider.r#type = self.provider_type.clone();
+        config.provider.model = self.model.clone();
+
+        // Determine env var names based on provider type
+        let key_var = match self.provider_type.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            _ => "OPENAI_API_KEY",
+        };
+        let url_var = match self.provider_type.as_str() {
+            "anthropic" => "ANTHROPIC_BASE_URL",
+            _ => "OPENAI_BASE_URL",
+        };
+
+        let mut updates = vec![(key_var.to_string(), self.api_key.clone())];
+        if !self.base_url.is_empty() {
+            updates.push((url_var.to_string(), self.base_url.clone()));
+        }
+        crate::provider::update_env_file(&self.env_path, &updates);
+    }
+
+    fn _field_label(idx: usize) -> &'static str {
+        match idx {
+            0 => "Type",
+            1 => "Model",
+            2 => "API Key",
+            3 => "Base URL",
+            _ => "",
+        }
+    }
+
+    fn field_value(&self, idx: usize) -> &str {
+        match idx {
+            0 => &self.provider_type,
+            1 => &self.model,
+            2 => &self.api_key,
+            3 => &self.base_url,
+            _ => "",
+        }
+    }
+
+    fn field_value_mut(&mut self, idx: usize) -> &mut String {
+        match idx {
+            0 => &mut self.provider_type,
+            1 => &mut self.model,
+            2 => &mut self.api_key,
+            3 => &mut self.base_url,
+            _ => unreachable!(),
+        }
+    }
+
+    fn cycle_type(&mut self) {
+        self.provider_type = match self.provider_type.as_str() {
+            "openai" => "anthropic".to_string(),
+            _ => "openai".to_string(),
+        };
+        // Update env var names for the new provider type
+        self.api_key = {
+            let var = match self.provider_type.as_str() {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                _ => "OPENAI_API_KEY",
+            };
+            std::env::var(var).unwrap_or_default()
+        };
+        self.base_url = {
+            let var = match self.provider_type.as_str() {
+                "anthropic" => "ANTHROPIC_BASE_URL",
+                _ => "OPENAI_BASE_URL",
+            };
+            std::env::var(var).unwrap_or_default()
+        };
+    }
+
+    fn update_suggestions(&mut self) {
+        let field = self.field_value(self.focus);
+        if field.is_empty() {
+            self.suggestions = (0..self.recent_models.len()).collect();
+        } else {
+            let lower = field.to_lowercase();
+            self.suggestions = self.recent_models
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.to_lowercase().contains(&lower))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        self.suggestion_idx = 0;
+    }
+}
+
 // ── App state ───────────────────────────────────────────────────────────────
 
 enum Page {
     Main,
     SwarmDetail,
+    ProviderDetail,
 }
 
 struct App {
@@ -337,12 +482,20 @@ struct App {
     saved: bool,
     page: Page,
     swarm_detail: SwarmDetail,
+    provider_detail: ProviderDetail,
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, env_path: std::path::PathBuf) -> Self {
         let swarm_detail = SwarmDetail::from_config(&config);
+        let provider_detail = ProviderDetail::from_config(&config, env_path);
         let features = vec![
+            FeatureItem {
+                feature: Feature::Provider,
+                label: "Provider",
+                description: "API key, base URL, model",
+                enabled: false, // not a toggle
+            },
             FeatureItem {
                 feature: Feature::Skills,
                 label: "Skills",
@@ -373,6 +526,12 @@ impl App {
                 description: "Multi-agent coordination",
                 enabled: config.features.is_enabled(Feature::Swarm),
             },
+            FeatureItem {
+                feature: Feature::AutoPoke,
+                label: "Auto-poke",
+                description: "Auto follow-up on incomplete todos",
+                enabled: config.features.is_enabled(Feature::AutoPoke),
+            },
         ];
 
         let mut list_state = ListState::default();
@@ -385,20 +544,33 @@ impl App {
             saved: false,
             page: Page::Main,
             swarm_detail,
+            provider_detail,
         }
     }
 
     fn toggle_selected(&mut self) {
         if let Some(i) = self.list_state.selected() {
-            self.features[i].enabled = !self.features[i].enabled;
+            if self.features[i].feature != Feature::Provider {
+                self.features[i].enabled = !self.features[i].enabled;
+            }
         }
     }
 
     fn open_selected(&mut self) {
         if let Some(i) = self.list_state.selected() {
-            if self.features[i].feature == Feature::Swarm {
-                self.swarm_detail = SwarmDetail::from_config(&self.config);
-                self.page = Page::SwarmDetail;
+            match self.features[i].feature {
+                Feature::Swarm => {
+                    self.swarm_detail = SwarmDetail::from_config(&self.config);
+                    self.page = Page::SwarmDetail;
+                }
+                Feature::Provider => {
+                    self.provider_detail = ProviderDetail::from_config(
+                        &self.config,
+                        self.provider_detail.env_path.clone(),
+                    );
+                    self.page = Page::ProviderDetail;
+                }
+                _ => {}
             }
         }
     }
@@ -422,13 +594,16 @@ impl App {
     fn apply_to_config(&mut self) {
         for item in &self.features {
             match item.feature {
+                Feature::Provider => {} // handled by provider_detail
                 Feature::Skills => self.config.features.skills.enabled = item.enabled,
                 Feature::Memory => self.config.features.memory.enabled = item.enabled,
                 Feature::Compaction => self.config.features.compaction.enabled = item.enabled,
                 Feature::Permissions => self.config.features.permissions.enabled = item.enabled,
                 Feature::Swarm => self.config.features.swarm.enabled = item.enabled,
+                Feature::AutoPoke => self.config.features.auto_poke.enabled = item.enabled,
             }
         }
+        self.provider_detail.apply(&mut self.config);
         self.swarm_detail.apply_to_config(&mut self.config);
     }
 }
@@ -505,7 +680,9 @@ fn draw_main(f: &mut Frame, app: &mut App) {
         .features
         .iter()
         .map(|item| {
-            let checkbox = if item.enabled {
+            let checkbox = if item.feature == Feature::Provider {
+                Span::styled(" ⚙ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else if item.enabled {
                 Span::styled(" ✓ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(" ✗ ", Style::default().fg(Color::DarkGray))
@@ -523,7 +700,7 @@ fn draw_main(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             );
             // Show hint for features with detail pages
-            let hint = if item.feature == Feature::Swarm {
+            let hint = if matches!(item.feature, Feature::Swarm | Feature::Provider) {
                 Span::styled(" (Enter: config)", Style::default().fg(Color::DarkGray))
             } else {
                 Span::raw("")
@@ -541,7 +718,7 @@ fn draw_main(f: &mut Frame, app: &mut App) {
     let features_list = List::new(items)
         .block(
             Block::default()
-                .title(" Features (Space to toggle) ")
+                .title(" Features (y/n toggle) ")
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -557,7 +734,7 @@ fn draw_main(f: &mut Frame, app: &mut App) {
     let status = Line::from(vec![
         Span::styled(" ↑↓", Style::default().fg(Color::Yellow)),
         Span::raw(" navigate  "),
-        Span::styled("Space", Style::default().fg(Color::Yellow)),
+        Span::styled("y/n", Style::default().fg(Color::Yellow)),
         Span::raw(" toggle  "),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
         Span::raw(" open detail  "),
@@ -815,10 +992,117 @@ fn draw_swarm_detail(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(status), chunks[3]);
 }
 
+fn draw_provider_detail(f: &mut Frame, app: &mut App) {
+    let pd = &app.provider_detail;
+    let input_height = if pd.editing { Constraint::Length(9) } else { Constraint::Length(0) };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3),  // title
+            Constraint::Min(8),    // fields
+            input_height,          // suggestions (when editing)
+            Constraint::Length(1),  // status bar
+        ])
+        .split(f.area());
+
+    // Title
+    let title = Paragraph::new("Provider settings")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Fields
+    let fields = [
+        ("Type", pd.provider_type.as_str(), true),   // cycling
+        ("Model", pd.model.as_str(), false),
+        ("API Key", if pd.show_key { pd.api_key.as_str() } else { if pd.api_key.is_empty() { "" } else { "••••••••" } }, false),
+        ("Base URL", pd.base_url.as_str(), false),
+    ];
+
+    let field_lines: Vec<Line> = fields.iter().enumerate().map(|(i, (label, value, is_cycle))| {
+        let focused = pd.focus == i;
+        let label_style = if focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let value_style = if focused {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else if value.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+
+        let display_val = if value.is_empty() { "(not set)" } else { *value };
+        let cycle_hint = if *is_cycle && focused { " ◄ ►" } else { "" };
+        let edit_hint = if !is_cycle && focused && pd.editing { "▌" } else { "" };
+
+        Line::from(vec![
+            Span::styled(format!("  {:<12}", label), label_style),
+            Span::styled(format!("{}{}", display_val, cycle_hint), value_style),
+            Span::styled(edit_hint, Style::default().fg(Color::Cyan)),
+        ])
+    }).collect();
+
+    let fields_block = Paragraph::new(field_lines)
+        .block(Block::default().title(" Settings ").borders(Borders::ALL));
+    f.render_widget(fields_block, chunks[1]);
+
+    // Suggestions (when editing a text field)
+    if pd.editing && !pd.suggestions.is_empty() {
+        let suggestion_items: Vec<ListItem> = pd.suggestions.iter().enumerate().map(|(si, &mi)| {
+            let style = if si == pd.suggestion_idx {
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {}", pd.recent_models[mi]), style),
+            ]))
+        }).collect();
+
+        let suggestions_list = List::new(suggestion_items)
+            .block(Block::default().title(" Suggestions (↑↓ select, Tab accept) ").borders(Borders::ALL));
+        f.render_widget(suggestions_list, chunks[2]);
+    }
+
+    // Status bar
+    let status = if pd.editing {
+        Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" confirm  "),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(" accept  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" cancel"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" ↑↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" navigate  "),
+            Span::styled("←→/Space", Style::default().fg(Color::Yellow)),
+            Span::raw(" cycle  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" edit  "),
+            Span::styled("k", Style::default().fg(Color::Yellow)),
+            Span::raw(" show/hide key  "),
+            Span::styled("s", Style::default().fg(Color::Yellow)),
+            Span::raw(" save  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" back"),
+        ])
+    };
+    f.render_widget(Paragraph::new(status), chunks[3]);
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     match app.page {
         Page::Main => draw_main(f, app),
         Page::SwarmDetail => draw_swarm_detail(f, app),
+        Page::ProviderDetail => draw_provider_detail(f, app),
     }
 }
 
@@ -827,14 +1111,14 @@ fn draw(f: &mut Frame, app: &mut App) {
 /// Run the interactive config TUI.
 ///
 /// Returns `Ok(true)` if the user saved changes, `Ok(false)` if they quit without saving.
-pub fn run(config: Config, save_path: &Path) -> Result<bool> {
+pub fn run(config: Config, save_path: &Path, env_path: std::path::PathBuf) -> Result<bool> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config);
+    let mut app = App::new(config, env_path);
     let result = run_loop(&mut terminal, &mut app);
 
     // Restore terminal
@@ -883,17 +1167,15 @@ fn run_loop(
                 }
                 (Page::Main, KeyCode::Up | KeyCode::Char('k')) => app.move_up(),
                 (Page::Main, KeyCode::Down | KeyCode::Char('j')) => app.move_down(),
-                (Page::Main, KeyCode::Char(' ') | KeyCode::Enter) => {
-                    // Space toggles, Enter opens detail (for Swarm) or toggles
-                    if key.code == KeyCode::Enter {
-                        if let Some(i) = app.list_state.selected() {
-                            if app.features[i].feature == Feature::Swarm {
-                                app.open_selected();
-                                continue;
-                            }
+                (Page::Main, KeyCode::Char('y') | KeyCode::Char('n')) => {
+                    app.toggle_selected();
+                }
+                (Page::Main, KeyCode::Enter) => {
+                    if let Some(i) = app.list_state.selected() {
+                        if matches!(app.features[i].feature, Feature::Swarm | Feature::Provider) {
+                            app.open_selected();
                         }
                     }
-                    app.toggle_selected();
                 }
 
                 // ── Swarm detail page ──
@@ -966,6 +1248,87 @@ fn run_loop(
                 }
                 (Page::SwarmDetail, KeyCode::Backspace) if app.swarm_detail.mode == DetailMode::Normal => {
                     app.swarm_detail.handle_backspace();
+                }
+
+                // ── Provider detail page ──
+                (Page::ProviderDetail, KeyCode::Esc) => {
+                    if app.provider_detail.editing {
+                        app.provider_detail.editing = false;
+                        app.provider_detail.suggestions.clear();
+                    } else {
+                        app.page = Page::Main;
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Char('s')) if !app.provider_detail.editing => {
+                    app.saved = true;
+                    return Ok(());
+                }
+                // ── Edit mode ──
+                (Page::ProviderDetail, KeyCode::Enter) if app.provider_detail.editing => {
+                    if !app.provider_detail.suggestions.is_empty() {
+                        let si = app.provider_detail.suggestion_idx;
+                        if si < app.provider_detail.suggestions.len() {
+                            let mi = app.provider_detail.suggestions[si];
+                            let val = app.provider_detail.recent_models[mi].clone();
+                            *app.provider_detail.field_value_mut(app.provider_detail.focus) = val;
+                        }
+                    }
+                    app.provider_detail.editing = false;
+                    app.provider_detail.suggestions.clear();
+                }
+                (Page::ProviderDetail, KeyCode::Tab) if app.provider_detail.editing => {
+                    if !app.provider_detail.suggestions.is_empty() {
+                        let si = app.provider_detail.suggestion_idx;
+                        if si < app.provider_detail.suggestions.len() {
+                            let mi = app.provider_detail.suggestions[si];
+                            let val = app.provider_detail.recent_models[mi].clone();
+                            *app.provider_detail.field_value_mut(app.provider_detail.focus) = val;
+                        }
+                        app.provider_detail.update_suggestions();
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Up) if app.provider_detail.editing => {
+                    if app.provider_detail.suggestion_idx > 0 {
+                        app.provider_detail.suggestion_idx -= 1;
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Down) if app.provider_detail.editing => {
+                    if app.provider_detail.suggestion_idx + 1 < app.provider_detail.suggestions.len() {
+                        app.provider_detail.suggestion_idx += 1;
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Char(c)) if app.provider_detail.editing => {
+                    app.provider_detail.field_value_mut(app.provider_detail.focus).push(c);
+                    app.provider_detail.update_suggestions();
+                }
+                (Page::ProviderDetail, KeyCode::Backspace) if app.provider_detail.editing => {
+                    app.provider_detail.field_value_mut(app.provider_detail.focus).pop();
+                    app.provider_detail.update_suggestions();
+                }
+                // ── Normal mode ──
+                (Page::ProviderDetail, KeyCode::Up | KeyCode::Char('k')) if !app.provider_detail.editing => {
+                    app.provider_detail.focus = app.provider_detail.focus.saturating_sub(1);
+                }
+                (Page::ProviderDetail, KeyCode::Down | KeyCode::Char('j')) if !app.provider_detail.editing => {
+                    if app.provider_detail.focus < 3 {
+                        app.provider_detail.focus += 1;
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right) if !app.provider_detail.editing => {
+                    if app.provider_detail.focus == 0 {
+                        app.provider_detail.cycle_type();
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Enter) if !app.provider_detail.editing => {
+                    if app.provider_detail.focus == 0 {
+                        app.provider_detail.cycle_type();
+                    } else {
+                        app.provider_detail.editing = true;
+                        app.provider_detail.update_suggestions();
+                    }
+                }
+                (Page::ProviderDetail, KeyCode::Char('k')) if !app.provider_detail.editing => {
+                    app.provider_detail.show_key = !app.provider_detail.show_key;
                 }
                 _ => {}
             }

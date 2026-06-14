@@ -87,6 +87,15 @@ pub struct AgentNotification {
     pub result: Result<String, String>,
 }
 
+/// Notification sent when a sub-agent accesses a file.
+/// Used to track which files are being edited by which agents.
+#[derive(Debug, Clone)]
+pub struct FileAccessNotification {
+    pub agent_id: String,
+    pub path: String,
+    pub operation: String,  // "read" | "write" | "edit" | "delete"
+}
+
 /// Context serialized to disk and loaded by a sub-agent spawned in a new terminal.
 ///
 /// When the coordinator spawns a sub-agent in a new terminal, it writes this

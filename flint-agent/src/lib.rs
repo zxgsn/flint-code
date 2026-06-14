@@ -10,7 +10,7 @@ pub mod tool;
 pub use agent::{run_turn, TurnStats};
 pub use checkpoint::CheckpointStore;
 pub use session::{Session, SessionMeta};
-pub use todo::TodoStore;
+pub use todo::{TodoStore, is_confirmation, format_todo_list, all_done, weighted_completion_confidence};
 pub use tool::{Tool, ToolContext, ToolRegistry};
 
 /// Structured event emitted during `run_turn` for real-time observation.

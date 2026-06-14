@@ -21,8 +21,8 @@ enum McpTransport {
         tool_names: Vec<String>,
     },
     Http {
-        client: Arc<HttpMcpClient>,
-        endpoint: String,
+        _client: Arc<HttpMcpClient>,
+        _endpoint: String,
         tool_names: Vec<String>,
     },
 }
@@ -131,7 +131,7 @@ impl McpManager {
 
         self.servers.insert(
             server_id.to_string(),
-            McpTransport::Http { client, endpoint, tool_names },
+            McpTransport::Http { _client: client, _endpoint: endpoint, tool_names },
         );
 
         Ok(tools)

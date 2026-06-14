@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
+    Provider,
     Skills,
     Memory,
     Compaction,
     Permissions,
     Swarm,
+    AutoPoke,
 }
 
 // ── Per-feature config blocks ───────────────────────────────────────────────
@@ -94,6 +96,11 @@ pub struct SwarmConfig {
 // ── Aggregate feature container ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPokeConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Features {
     pub skills: SkillConfig,
     pub memory: MemoryConfig,
@@ -101,17 +108,21 @@ pub struct Features {
     pub permissions: PermissionConfig,
     #[serde(default)]
     pub swarm: SwarmConfig,
+    #[serde(default)]
+    pub auto_poke: AutoPokeConfig,
 }
 
 impl Features {
     /// Check whether a specific feature is enabled.
     pub fn is_enabled(&self, feature: Feature) -> bool {
         match feature {
+            Feature::Provider => false, // not a toggle
             Feature::Skills => self.skills.enabled,
             Feature::Memory => self.memory.enabled,
             Feature::Compaction => self.compaction.enabled,
             Feature::Permissions => self.permissions.enabled,
             Feature::Swarm => self.swarm.enabled,
+            Feature::AutoPoke => self.auto_poke.enabled,
         }
     }
 }
@@ -205,6 +216,12 @@ impl Default for SwarmConfig {
     }
 }
 
+impl Default for AutoPokeConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl Default for Features {
     fn default() -> Self {
         Self {
@@ -213,6 +230,7 @@ impl Default for Features {
             compaction: CompactionConfig::default(),
             permissions: PermissionConfig::default(),
             swarm: SwarmConfig::default(),
+            auto_poke: AutoPokeConfig::default(),
         }
     }
 }
