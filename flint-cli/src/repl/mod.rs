@@ -741,15 +741,31 @@ pub async fn run(
         // Remember the last assistant message index for extraction
         let pre_turn_msg_count = session.messages.len();
 
+        // Timer for real-time execution time display
+        let turn_start = std::time::Instant::now();
+        let last_print_time = Arc::new(Mutex::new(std::time::Instant::now()));
+        eprintln!("\x1b[90m  [executing...]\x1b[0m");
+
         // Callback that drains sub-agent notifications and stream output in real-time
         // during run_turn, so the user sees progress without waiting for the turn to end.
         let cb_notify = swarm_notify_shared.clone();
         let cb_swarm = swarm.clone();
         let cb_file_access = file_access_rx.clone();
+        let cb_start = turn_start.clone();
+        let cb_last_print = last_print_time.clone();
         let turn_callback: flint_agent::EventCallback = Box::new(move |_event| {
             drain_and_display_notifications_sync(&cb_notify, &cb_swarm);
             drain_and_display_streams_sync(&cb_swarm);
             drain_file_access_notifications(&cb_file_access, &cb_swarm);
+
+            // Print elapsed time every 10 seconds
+            let now = std::time::Instant::now();
+            let mut last = cb_last_print.lock().unwrap();
+            if now.duration_since(*last).as_secs() >= 10 {
+                let elapsed = cb_start.elapsed();
+                eprint!("\x1b[90m  [{:.1}s]\x1b[0m ", elapsed.as_secs_f64());
+                *last = now;
+            }
             true
         });
 
@@ -780,6 +796,7 @@ pub async fn run(
         .await
         {
             Ok((_text, stats)) => {
+                let turn_elapsed = turn_start.elapsed();
                 total_tool_calls += stats.tool_calls;
 
                 // Auto-extract memories from the conversation (if enabled)

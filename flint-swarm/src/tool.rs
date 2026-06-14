@@ -32,12 +32,110 @@ use anyhow::Result;
 use async_trait::async_trait;
 use flint_agent::{Tool, ToolContext, ToolRegistry};
 use flint_types::{ToolDefinition, ToolOutput};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
 use crate::manager::SwarmManager;
 use crate::router::MessageRouter;
 
 type SharedSwarm = Arc<Mutex<SwarmManager>>;
+
+/// Extract potential file paths from a task prompt.
+///
+/// This function uses heuristic pattern matching to identify file paths
+/// mentioned in the prompt. It looks for:
+/// - Common file extensions (.rs, .py, .js, .ts, .toml, .json, etc.)
+/// - Path patterns (src/, lib/, tests/, etc.)
+/// - Quoted strings that look like file paths
+fn extract_file_paths_from_prompt(prompt: &str) -> HashSet<String> {
+    let mut paths = HashSet::new();
+
+    // Common file extensions
+    let extensions = [
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".toml", ".json",
+        ".yaml", ".yml", ".md", ".txt", ".html", ".css", ".go", ".java",
+        ".c", ".cpp", ".h", ".hpp", ".sh", ".bash", ".ps1", ".bat",
+    ];
+
+    // Common path prefixes
+    let prefixes = [
+        "src/", "lib/", "tests/", "test/", "docs/", "doc/", "scripts/",
+        "bin/", "examples/", "benches/", "build/", "dist/", "out/",
+        "target/", "node_modules/", ".github/", ".gitlab/",
+    ];
+
+    // Split prompt into words and check each
+    let words: Vec<&str> = prompt.split_whitespace().collect();
+    for word in &words {
+        // Remove common punctuation
+        let clean_word = word.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}');
+
+        // Check if it has a file extension
+        if extensions.iter().any(|ext| clean_word.ends_with(ext)) {
+            // Basic validation: must have at least one character before extension
+            if clean_word.len() > 4 && !clean_word.starts_with('.') {
+                paths.insert(clean_word.to_string());
+            }
+        }
+
+        // Check if it starts with a common path prefix
+        if prefixes.iter().any(|prefix| clean_word.starts_with(prefix)) {
+            paths.insert(clean_word.to_string());
+        }
+    }
+
+    // Also look for patterns like "file `path`" or "in `path`"
+    let lower = prompt.to_lowercase();
+    let file_indicators = ["file ", "edit ", "modify ", "update ", "create ", "write ", "in ", "at "];
+    for indicator in &file_indicators {
+        if let Some(pos) = lower.find(indicator) {
+            let after = &prompt[pos + indicator.len()..];
+            // Find the next word (possibly quoted)
+            let trimmed = after.trim_start();
+            if trimmed.starts_with('`') || trimmed.starts_with('"') || trimmed.starts_with('\'') {
+                let quote_char = trimmed.chars().next().unwrap();
+                if let Some(end_quote) = trimmed[1..].find(quote_char) {
+                    let path = &trimmed[1..end_quote + 1];
+                    if !path.is_empty() && (extensions.iter().any(|ext| path.ends_with(ext)) || prefixes.iter().any(|prefix| path.starts_with(prefix))) {
+                        paths.insert(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+/// Check if a task prompt has file conflicts with currently running agents.
+///
+/// Returns (has_conflict, conflicting_files, conflicting_agents).
+fn check_file_conflicts(
+    prompt: &str,
+    swarm: &SwarmManager,
+) -> (bool, Vec<String>, Vec<String>) {
+    let requested_files = extract_file_paths_from_prompt(prompt);
+    if requested_files.is_empty() {
+        return (false, Vec::new(), Vec::new());
+    }
+
+    let mut conflicting_files = Vec::new();
+    let mut conflicting_agents = Vec::new();
+
+    for file in &requested_files {
+        let agents = swarm.get_file_agents(file);
+        if !agents.is_empty() {
+            conflicting_files.push(file.clone());
+            for agent in &agents {
+                if !conflicting_agents.contains(agent) {
+                    conflicting_agents.push(agent.clone());
+                }
+            }
+        }
+    }
+
+    (!conflicting_files.is_empty(), conflicting_files, conflicting_agents)
+}
 
 /// Closure that builds a provider for a given model name.
 /// Returns None on failure (caller should fall back to default).
@@ -172,7 +270,8 @@ impl Tool for SwarmTool {
                     "mode": { "type": "string", "description": "terminal (new terminal with full REPL), interactive (streaming display in main terminal), or in-process (background task). Default comes from config.", "enum": ["terminal", "interactive", "in-process"] },
                     "full_context": { "type": "boolean", "description": "For terminal mode: inherit full conversation history (default false, inherits only system prompt + task)", "default": false },
                     "model": { "type": "string", "description": "Override model (only in 'auto' mode). In 'slots' mode this is ignored — models are assigned automatically." },
-                    "slot": { "type": "integer", "description": "Agent slot number (1-indexed). In 'slots' mode, models are auto-assigned if omitted. In 'auto' mode, optionally picks a pre-configured slot model." }
+                    "slot": { "type": "integer", "description": "Agent slot number (1-indexed). In 'slots' mode, models are auto-assigned if omitted. In 'auto' mode, optionally picks a pre-configured slot model." },
+                    "force": { "type": "boolean", "description": "Force spawn even if file conflicts detected (default false)", "default": false }
                 },
                 "required": ["command"]
             }),
@@ -195,6 +294,58 @@ impl Tool for SwarmTool {
                 let prompt = input["prompt"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("missing 'prompt'"))?;
                 let mode = input["mode"].as_str().unwrap_or(&self.default_spawn_mode);
+
+                // Pre-analyze task for file conflicts
+                let (has_conflict, conflicting_files, conflicting_agents) = {
+                    let swarm = self.swarm.lock().unwrap();
+                    check_file_conflicts(prompt, &swarm)
+                };
+
+                let force = input["force"].as_bool().unwrap_or(false);
+
+                if has_conflict && !force {
+                    let file_list = conflicting_files.join(", ");
+                    let agent_list: Vec<String> = conflicting_agents.iter()
+                        .map(|a| {
+                            let short = a.strip_prefix("agent_").unwrap_or(a);
+                            short[..4.min(short.len())].to_string()
+                        })
+                        .collect();
+
+                    eprintln!(
+                        "\x1b[33m  [swarm] ⚠ File conflict detected!\x1b[0m"
+                    );
+                    eprintln!(
+                        "\x1b[33m    Files: {}\x1b[0m", file_list
+                    );
+                    eprintln!(
+                        "\x1b[33m    Agents: {}\x1b[0m", agent_list.join(", ")
+                    );
+                    eprintln!(
+                        "\x1b[90m    Consider waiting for these agents to complete or reassigning tasks.\x1b[0m"
+                    );
+
+                    // Return warning to the coordinator LLM
+                    return Ok(ToolOutput::text(format!(
+                        "⚠ FILE CONFLICT WARNING: The requested task may conflict with \
+                         running agents.\n\n\
+                         Files potentially in use: {}\n\
+                         Agents accessing them: {}\n\n\
+                         Recommendations:\n\
+                         1. Wait for conflicting agents to complete: swarm wait agent_id=<id>\n\
+                         2. Reassign the task to not overlap files\n\
+                         3. Proceed anyway (add force=true to override this warning)\n\n\
+                         To proceed despite conflicts, set force=true in the spawn command.",
+                        file_list,
+                        agent_list.join(", ")
+                    )));
+                } else if has_conflict && force {
+                    let file_list = conflicting_files.join(", ");
+                    eprintln!(
+                        "\x1b[33m  [swarm] ⚠ Proceeding despite file conflicts: {}\x1b[0m",
+                        file_list
+                    );
+                }
 
                 // Resolve model based on selection strategy
                 let resolved_model = match self.model_selection.as_str() {
