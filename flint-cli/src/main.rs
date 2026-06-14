@@ -186,7 +186,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
     }
 
     // Build provider; on failure, launch setup wizard
-    let raw_prov: Box<dyn Provider> = match provider::build_provider(&provider_type, &model) {
+    let raw_prov: Box<dyn Provider> = match provider::build_provider_with_config(
+        &provider_type, &model, &config.provider.model_base_urls, &config.provider.model_api_keys
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}\n", e);
@@ -200,7 +202,7 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             provider::load_env_override(&env_path);
             let new_type = std::env::var("FLINT_PROVIDER").unwrap_or_else(|_| provider_type.clone());
             let new_model = std::env::var("FLINT_MODEL").unwrap_or_else(|_| model.clone());
-            provider::build_provider(&new_type, &new_model)?
+            provider::build_provider_with_config(&new_type, &new_model, &config.provider.model_base_urls, &config.provider.model_api_keys)?
         }
     };
 
@@ -245,8 +247,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
         system.push_str("\n\n## Todo Tool\n\
             For multi-step requests, you MUST use the `todo` tool first:\n\
             1. `todo add` each sub-task before starting work\n\
-            2. Execute them one by one\n\
-            3. `todo update` each to `completed` when done\n\n\
+            2. For simple tasks, execute directly\n\
+            3. For complex or independent tasks, consider `swarm spawn` to parallelize\n\
+            4. `todo update` each to `completed` when done\n\n\
             Simple single-step tasks (one read, one write, one question) do not need todos.\n\
             After each turn with incomplete todos, you will receive an automatic \
             \"continue working\" prompt — keep going until all are done.\n\n\
@@ -286,10 +289,13 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
 
     // Initialize todo system (main agent only, not sub-agents)
     let todo_store = flint_agent::todo::new_store();
+    let swarm_is_enabled = config.features.is_enabled(Feature::Swarm);
     let auto_poke = if args.spawn_context.is_none() {
         tools::register_todo_tool(&mut registry, todo_store.clone());
         if config.features.auto_poke.enabled {
-            Some(crate::repl::auto_poke::AutoPoke::new(todo_store))
+            let mut ap = crate::repl::auto_poke::AutoPoke::new(todo_store);
+            ap.swarm_enabled = swarm_is_enabled;
+            Some(ap)
         } else {
             None
         }
@@ -364,7 +370,9 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
             // Build a separate provider for sub-agents if swarm model is configured
             let sub_agent_prov: Arc<dyn Provider> =
                 if let Some(ref swarm_model) = config.features.swarm.model {
-                    match provider::build_provider(&config.provider.r#type, swarm_model) {
+                    match provider::build_provider_with_config(
+                        &config.provider.r#type, swarm_model, &config.provider.model_base_urls, &config.provider.model_api_keys
+                    ) {
                         Ok(p) => Arc::from(p),
                         Err(e) => {
                             eprintln!("Warning: failed to build swarm model provider ({}), falling back to main model", e);
@@ -415,7 +423,11 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                 - For parallel work, call multiple `swarm spawn` in ONE message.\n\
                 - Sub-agent results are delivered AUTOMATICALLY when they complete.\n\
                 - Do NOT use swarm wait — results arrive as system messages.\n\
-                - After spawning, respond to the user immediately. Results will appear later.\n\
+                - After spawning, respond to the user immediately. Results will appear later.\n\n\
+                **Todo integration:**\n\
+                - When you have multiple independent todos, spawn one sub-agent per todo.\n\
+                - Simple todos should be executed directly by you (the coordinator).\n\
+                - Update todo status after sub-agent results arrive.\n\
                 {}",
                 system, slot_info
             );
@@ -424,8 +436,10 @@ async fn cmd_agent(args: AgentArgs, working_dir: &std::path::Path) -> Result<()>
                 .map(|p| p.model.clone())
                 .collect();
             let swarm_provider_type = config.provider.r#type.clone();
+            let model_base_urls = config.provider.model_base_urls.clone();
+            let model_api_keys = config.provider.model_api_keys.clone();
             let build_provider: flint_swarm::ProviderFactory = Box::new(move |model: &str| {
-                provider::build_provider(&swarm_provider_type, model)
+                provider::build_provider_with_config(&swarm_provider_type, model, &model_base_urls, &model_api_keys)
                     .ok()
                     .map(|p| Arc::from(p) as Arc<dyn Provider>)
             });

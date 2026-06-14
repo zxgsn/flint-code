@@ -24,6 +24,18 @@ pub struct ProviderConfig {
     /// Previously used custom models (persisted across sessions).
     #[serde(default)]
     pub recent_models: Vec<String>,
+    /// Per-model base URL overrides. Key is model name prefix or full name.
+    /// Example: {"mimo": "https://mimo-api.com/v1", "gpt": "https://api.openai.com/v1"}
+    /// When switching models, the system checks if the model name starts with any key.
+    /// If matched, uses that base URL instead of the environment variable.
+    #[serde(default)]
+    pub model_base_urls: std::collections::HashMap<String, String>,
+    /// Per-model API key overrides. Key is model name prefix or full name.
+    /// Example: {"agnes": "sk-xxx", "mimo": "tp-yyy"}
+    /// When switching models, the system checks if the model name starts with any key.
+    /// If matched, uses that API key instead of the environment variable.
+    #[serde(default)]
+    pub model_api_keys: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +275,14 @@ fn merge_provider(target: &mut crate::config::ProviderConfig, source: &crate::co
             target.recent_models.push(m.clone());
         }
     }
+    // Merge model_base_urls: source entries override target entries
+    for (k, v) in &source.model_base_urls {
+        target.model_base_urls.insert(k.clone(), v.clone());
+    }
+    // Merge model_api_keys: source entries override target entries
+    for (k, v) in &source.model_api_keys {
+        target.model_api_keys.insert(k.clone(), v.clone());
+    }
 }
 
 fn merge_agent(target: &mut AgentConfig, source: &AgentConfig) {
@@ -332,7 +352,7 @@ fn default_max_output_chars() -> usize {
 }
 
 fn default_context_window_chars() -> usize {
-    500_000 // ~125k tokens
+    800_000 // ~200k tokens
 }
 
 fn default_true() -> bool {
@@ -358,6 +378,8 @@ impl Default for ProviderConfig {
             r#type: default_provider_type(),
             model: default_model(),
             recent_models: Vec::new(),
+            model_base_urls: std::collections::HashMap::new(),
+            model_api_keys: std::collections::HashMap::new(),
         }
     }
 }

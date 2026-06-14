@@ -126,7 +126,7 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
                 // Reload .env in case API key/URL changed
                 let env_path = crate::provider::resolve_env_path(sc.working_dir);
                 crate::provider::load_env_override(&env_path);
-                match crate::provider::build_provider(&sc.config.provider.r#type, &sc.config.provider.model) {
+                match crate::provider::build_provider_with_config(&sc.config.provider.r#type, &sc.config.provider.model, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
                     Ok(p) => {
                         *sc.prov = Arc::from(p);
                         eprintln!("Provider: {} / {}\n", sc.config.provider.r#type, sc.config.provider.model);
@@ -155,66 +155,89 @@ pub async fn dispatch(action: SlashAction, sc: &mut SlashContext<'_>) -> Result<
                 }
             }
 
-            // Re-initialize swarm if it was just enabled
-            if sc.config.features.is_enabled(flint_config::Feature::Swarm) && sc.swarm.is_none() {
-                let swarm_config = flint_swarm::SwarmConfig {
-                    max_agents: sc.config.features.swarm.max_agents,
-                    agent_max_turns: sc.config.features.swarm.agent_max_turns,
-                    max_output_chars: sc.config.agent.max_output_chars,
-                    open_viewer: true,
-                };
-                let (output_tx, output_rx) = flint_swarm::output::channel();
-                tokio::spawn(flint_swarm::output::display_loop(output_rx));
-                // Clone registry before registering swarm tool
-                // Build a separate provider for sub-agents if swarm model is configured
-                let sub_agent_prov: Arc<dyn Provider> =
-                    if let Some(ref swarm_model) = sc.config.features.swarm.model {
-                        match provider::build_provider(&sc.config.provider.r#type, swarm_model) {
-                            Ok(p) => Arc::from(p),
-                            Err(e) => {
-                                eprintln!("Warning: failed to build swarm model ({}), using main model", e);
-                                sc.prov.clone()
+            // Re-initialize swarm if it was just enabled, or update existing swarm's model
+            if sc.config.features.is_enabled(flint_config::Feature::Swarm) {
+                if let Some(ref swarm_arc) = sc.swarm {
+                    // Swarm already exists — update its provider if swarm model changed
+                    let new_provider: Arc<dyn Provider> =
+                        if let Some(ref swarm_model) = sc.config.features.swarm.model {
+                            match provider::build_provider_with_config(&sc.config.provider.r#type, swarm_model, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
+                                Ok(p) => Arc::from(p),
+                                Err(e) => {
+                                    eprintln!("Warning: failed to build swarm model ({}), using main model", e);
+                                    sc.prov.clone()
+                                }
                             }
-                        }
-                    } else {
-                        sc.prov.clone()
+                        } else {
+                            sc.prov.clone()
+                        };
+                    if let Ok(mut swarm) = swarm_arc.lock() {
+                        swarm.set_provider(new_provider);
+                        eprintln!("Swarm: updated default model");
+                    }
+                } else {
+                    // Swarm not yet initialized — create new
+                    let swarm_config = flint_swarm::SwarmConfig {
+                        max_agents: sc.config.features.swarm.max_agents,
+                        agent_max_turns: sc.config.features.swarm.agent_max_turns,
+                        max_output_chars: sc.config.agent.max_output_chars,
+                        open_viewer: true,
                     };
+                    let (output_tx, output_rx) = flint_swarm::output::channel();
+                    tokio::spawn(flint_swarm::output::display_loop(output_rx));
+                    // Clone registry before registering swarm tool
+                    // Build a separate provider for sub-agents if swarm model is configured
+                    let sub_agent_prov: Arc<dyn Provider> =
+                        if let Some(ref swarm_model) = sc.config.features.swarm.model {
+                            match provider::build_provider_with_config(&sc.config.provider.r#type, swarm_model, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
+                                Ok(p) => Arc::from(p),
+                                Err(e) => {
+                                    eprintln!("Warning: failed to build swarm model ({}), using main model", e);
+                                    sc.prov.clone()
+                                }
+                            }
+                        } else {
+                            sc.prov.clone()
+                        };
 
-                let sub_agent_registry = sc.registry.clone();
-                let manager = flint_swarm::SwarmManager::new(
-                    swarm_config,
-                    sub_agent_prov,
-                    sc.working_dir.to_path_buf(),
-                    sc.system.to_string(),
-                    output_tx,
-                    sub_agent_registry,
-                    None, // No router when initializing from slash command
-                );
-                let shared = Arc::new(Mutex::new(manager));
+                    let sub_agent_registry = sc.registry.clone();
+                    let manager = flint_swarm::SwarmManager::new(
+                        swarm_config,
+                        sub_agent_prov,
+                        sc.working_dir.to_path_buf(),
+                        sc.system.to_string(),
+                        output_tx,
+                        sub_agent_registry,
+                        None, // No router when initializing from slash command
+                    );
+                    let shared = Arc::new(Mutex::new(manager));
 
-                // Build agent models list and provider factory for SwarmTool
-                let agent_models: Vec<String> = sc.config.features.swarm.agents.iter()
-                    .map(|p| p.model.clone())
-                    .collect();
-                let swarm_prov_type = sc.config.provider.r#type.clone();
-                let build_provider: flint_swarm::ProviderFactory = Box::new(move |model: &str| {
-                    provider::build_provider(&swarm_prov_type, model)
-                        .ok()
-                        .map(|p| Arc::from(p) as Arc<dyn Provider>)
-                });
+                    // Build agent models list and provider factory for SwarmTool
+                    let agent_models: Vec<String> = sc.config.features.swarm.agents.iter()
+                        .map(|p| p.model.clone())
+                        .collect();
+                    let swarm_prov_type = sc.config.provider.r#type.clone();
+                    let swarm_model_base_urls = sc.config.provider.model_base_urls.clone();
+                    let swarm_model_api_keys = sc.config.provider.model_api_keys.clone();
+                    let build_provider: flint_swarm::ProviderFactory = Box::new(move |model: &str| {
+                        provider::build_provider_with_config(&swarm_prov_type, model, &swarm_model_base_urls, &swarm_model_api_keys)
+                            .ok()
+                            .map(|p| Arc::from(p) as Arc<dyn Provider>)
+                    });
 
-                flint_swarm::register_swarm_tools(
-                    sc.registry,
-                    shared.clone(),
-                    None,
-                    sc.config.features.swarm.spawn_mode.clone(),
-                    sc.config.features.swarm.model.clone(),
-                    agent_models,
-                    build_provider,
-                    sc.config.features.swarm.model_selection.clone(),
-                );
-                *sc.swarm = Some(shared);
-                eprintln!("Swarm: enabled (max {} agents)", sc.config.features.swarm.max_agents);
+                    flint_swarm::register_swarm_tools(
+                        sc.registry,
+                        shared.clone(),
+                        None,
+                        sc.config.features.swarm.spawn_mode.clone(),
+                        sc.config.features.swarm.model.clone(),
+                        agent_models,
+                        build_provider,
+                        sc.config.features.swarm.model_selection.clone(),
+                    );
+                    *sc.swarm = Some(shared);
+                    eprintln!("Swarm: enabled (max {} agents)", sc.config.features.swarm.max_agents);
+                }
             }
 
             println!();
@@ -461,7 +484,7 @@ fn dispatch_setup(sc: &mut SlashContext<'_>) -> Result<()> {
         .unwrap_or_else(|_| sc.config.provider.r#type.clone());
     let p_model =
         std::env::var("FLINT_MODEL").unwrap_or_else(|_| sc.config.provider.model.clone());
-    match provider::build_provider(&p_type, &p_model) {
+    match provider::build_provider_with_config(&p_type, &p_model, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
         Ok(p) => {
             *sc.prov = Arc::from(p);
             sc.config.provider.r#type = p_type;
@@ -477,9 +500,10 @@ fn dispatch_setup(sc: &mut SlashContext<'_>) -> Result<()> {
 fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()> {
     match name {
         Some(m) => {
-            match provider::build_provider(&sc.config.provider.r#type, &m) {
+            match provider::build_provider_with_config(&sc.config.provider.r#type, &m, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
                 Ok(p) => {
-                    *sc.prov = Arc::from(p);
+                    let new_provider: Arc<dyn Provider> = Arc::from(p);
+                    *sc.prov = new_provider.clone();
                     sc.config.provider.model = m.clone();
                     // Sync env var so it reflects the current model
                     std::env::set_var("FLINT_MODEL", &m);
@@ -488,6 +512,13 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                         && !sc.config.provider.recent_models.contains(&m)
                     {
                         sc.config.provider.recent_models.push(m.clone());
+                    }
+                    // Update swarm provider if swarm is enabled
+                    if let Some(ref swarm_arc) = sc.swarm {
+                        if let Ok(mut swarm) = swarm_arc.lock() {
+                            swarm.set_provider(new_provider.clone());
+                            eprintln!("Swarm: updated default model to {}", m);
+                        }
                     }
                     let _ = sc.config.save(&sc.working_dir.join(".flint.toml"));
                     println!("Switched to model: {}\n", m);
@@ -513,7 +544,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                                 provider::load_env_override(&env_path);
                                 let p_type = std::env::var("FLINT_PROVIDER")
                                     .unwrap_or_else(|_| sc.config.provider.r#type.clone());
-                                match provider::build_provider(&p_type, &m) {
+                                match provider::build_provider_with_config(&p_type, &m, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
                                     Ok(p) => {
                                         *sc.prov = Arc::from(p);
                                         sc.config.provider.r#type = p_type;
@@ -529,7 +560,7 @@ fn dispatch_model(name: Option<String>, sc: &mut SlashContext<'_>) -> Result<()>
                             Err(e) => println!("Setup error: {}\n", e),
                         }
                     } else {
-                        match provider::build_provider(&sc.config.provider.r#type, &m) {
+                        match provider::build_provider_with_config(&sc.config.provider.r#type, &m, &sc.config.provider.model_base_urls, &sc.config.provider.model_api_keys) {
                             Ok(p) => {
                                 *sc.prov = Arc::from(p);
                                 sc.config.provider.model = m.clone();
